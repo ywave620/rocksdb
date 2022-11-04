@@ -1440,6 +1440,21 @@ TEST_F(DBFlushTest, MemPurgeAndCompactionFilter) {
   ASSERT_EQ(Get(KEY5), p_v5);
 }
 
+TEST_F(DBFlushTest, TolerateBadWriteBufSizeAndArenaBlockSize) {
+  Options options = CurrentOptions();
+
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+
+  // Check that no crash when construcing a Memtable
+  // even with bad choice of these two variables
+  // https://github.com/facebook/rocksdb/issues/10713
+  options.arena_block_size = 1024*1024*16;
+  options.write_buffer_size = 1024*1024*2;
+
+  ASSERT_OK(TryReopen(options));
+}
+
 TEST_F(DBFlushTest, DISABLED_MemPurgeWALSupport) {
   Options options = CurrentOptions();
 
@@ -1528,6 +1543,9 @@ TEST_F(DBFlushTest, DISABLED_MemPurgeWALSupport) {
 
       // Insert K-V into default CF.
       for (size_t k = KVSIZE / 2; k < KVSIZE; k++) {
+        // ROGER: the first flush (i.e. notify the bg flush thread) we triggered happens inside this loop
+        // we have one imm memtable only, but the flush thread still decides to do a mempurge, which is
+        // just effectless
         ASSERT_OK(Put(0, keys[k], values_default[k]));
       }
 
@@ -1570,6 +1588,8 @@ TEST_F(DBFlushTest, DISABLED_MemPurgeWALSupport) {
     // Check that there was no SST files created during flush.
     const uint32_t EXPECTED_SST_COUNT = 0;
 
+    #include <iostream>
+    std::cout << mempurge_count << ' ' << sst_count << '\n'; // 8, 0
     EXPECT_GE(mempurge_count.exchange(0), EXPECTED_MIN_MEMPURGE_COUNT);
     if (options.experimental_mempurge_threshold ==
         std::numeric_limits<double>::max()) {

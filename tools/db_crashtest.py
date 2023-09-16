@@ -133,7 +133,7 @@ default_params = {
     # use_put_entity_one_in has to be the same across invocations for verification to work, hence no lambda
     "use_put_entity_one_in": random.choice([0] * 7 + [1, 5, 10]),
     # 999 -> use Bloom API
-    "ribbon_starting_level": lambda: random.choice([random.randint(-1, 10), 999]),
+    "bloom_before_level": lambda: random.choice([random.randint(-1, 2), random.randint(-1, 10), 0x7fffffff - 1, 0x7fffffff]),
     "value_size_mult": 32,
     "verification_only": 0,
     "verify_checksum": 1,
@@ -158,9 +158,8 @@ default_params = {
     "sync": lambda: random.choice([1 if t == 0 else 0 for t in range(0, 20)]),
     "bytes_per_sync": lambda: random.choice([0, 262144]),
     "wal_bytes_per_sync": lambda: random.choice([0, 524288]),
-    # Disable compaction_readahead_size because the test is not passing.
-    # "compaction_readahead_size" : lambda : random.choice(
-    #    [0, 0, 1024 * 1024]),
+    "compaction_readahead_size" : lambda : random.choice(
+        [0, 0, 1024 * 1024]),
     "db_write_buffer_size": lambda: random.choice(
         [0, 0, 0, 1024 * 1024, 8 * 1024 * 1024, 128 * 1024 * 1024]
     ),

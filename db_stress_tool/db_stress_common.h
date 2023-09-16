@@ -37,6 +37,7 @@
 
 #include "db/db_impl/db_impl.h"
 #include "db/version_set.h"
+#include "db/wide/wide_columns_helper.h"
 #include "db_stress_tool/db_stress_env_wrapper.h"
 #include "db_stress_tool/db_stress_listener.h"
 #include "db_stress_tool/db_stress_shared_state.h"
@@ -158,7 +159,7 @@ DECLARE_double(experimental_mempurge_threshold);
 DECLARE_bool(enable_write_thread_adaptive_yield);
 DECLARE_int32(reopen);
 DECLARE_double(bloom_bits);
-DECLARE_int32(ribbon_starting_level);
+DECLARE_int32(bloom_before_level);
 DECLARE_bool(partition_filters);
 DECLARE_bool(optimize_filters_for_memory);
 DECLARE_bool(detect_filter_construct_corruption);
@@ -629,13 +630,7 @@ inline std::string WideColumnsToHex(const WideColumns& columns) {
 
   std::ostringstream oss;
 
-  oss << std::hex;
-
-  auto it = columns.begin();
-  oss << *it;
-  for (++it; it != columns.end(); ++it) {
-    oss << ' ' << *it;
-  }
+  WideColumnsHelper::DumpWideColumns(columns, oss, true);
 
   return oss.str();
 }

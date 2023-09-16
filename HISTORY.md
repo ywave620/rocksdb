@@ -12,7 +12,7 @@
 * Add a column family option `memtable_max_range_deletions` that limits the number of range deletions in a memtable. RocksDB will try to do an automatic flush after the limit is reached. (#11358)
 * Add PutEntity API in sst_file_writer
 * Add `timeout` in microsecond option to `WaitForCompactOptions` to allow timely termination of prolonged waiting in scenarios like recurring recoverable errors, such as out-of-space situations and continuous write streams that sustain ongoing flush and compactions
-* New statistics `rocksdb.file.read.{db.open|get|multiget|db.iterator|verify.checksum|verify.file.checksums}.micros` measure read time of block-based SST tables or blob files during db open, `Get()`, `MultiGet()`, using db iterator, `VerifyFileChecksums()` and `VerifyChecksum()`. They require stats level greater than `StatsLevel::kExceptDetailedTimers`.
+* New statistics `rocksdb.file.read.{get|multiget|db.iterator|verify.checksum|verify.file.checksums}.micros` measure read time of block-based SST tables or blob files during db open, `Get()`, `MultiGet()`, using db iterator, `VerifyFileChecksums()` and `VerifyChecksum()`. They require stats level greater than `StatsLevel::kExceptDetailedTimers`.
 * Add close_db option to `WaitForCompactOptions` to call Close() after waiting is done.
 * Add a new compression option `CompressionOptions::checksum` for enabling ZSTD's checksum feature to detect corruption during decompression.
 
@@ -22,7 +22,6 @@
 ### Behavior Changes
 * Statistics `rocksdb.sst.read.micros` now includes time spent on multi read and async read into the file
 * For Universal Compaction users, periodic compaction (option `periodic_compaction_seconds`) will be set to 30 days by default if block based table is used.
-* `Options::compaction_readahead_size` will be sanitized to 2MB when set to 0 under non-direct IO since we have moved prefetching responsibility to page cache for compaction read with readhead size equal to `Options::compaction_readahead_size` under non-direct IO (#11631)
 
 ### Bug Fixes
 * Fix a bug in FileTTLBooster that can cause users with a large number of levels (more than 65) to see errors like "runtime error: shift exponent .. is too large.." (#11673).

@@ -6,7 +6,7 @@
 //
 #include "rocksdb/utilities/ldb_cmd.h"
 
-#include <cinttypes>
+#include <cstddef>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
@@ -22,6 +22,8 @@
 #include "db/dbformat.h"
 #include "db/log_reader.h"
 #include "db/version_util.h"
+#include "db/wide/wide_column_serialization.h"
+#include "db/wide/wide_columns_helper.h"
 #include "db/write_batch_internal.h"
 #include "file/filename.h"
 #include "rocksdb/cache.h"
@@ -206,9 +208,15 @@ LDBCommand* LDBCommand::SelectCommand(const ParsedParams& parsed_params) {
   if (parsed_params.cmd == GetCommand::Name()) {
     return new GetCommand(parsed_params.cmd_params, parsed_params.option_map,
                           parsed_params.flags);
+  } else if (parsed_params.cmd == GetEntityCommand::Name()) {
+    return new GetEntityCommand(parsed_params.cmd_params,
+                                parsed_params.option_map, parsed_params.flags);
   } else if (parsed_params.cmd == PutCommand::Name()) {
     return new PutCommand(parsed_params.cmd_params, parsed_params.option_map,
                           parsed_params.flags);
+  } else if (parsed_params.cmd == PutEntityCommand::Name()) {
+    return new PutEntityCommand(parsed_params.cmd_params,
+                                parsed_params.option_map, parsed_params.flags);
   } else if (parsed_params.cmd == BatchPutCommand::Name()) {
     return new BatchPutCommand(parsed_params.cmd_params,
                                parsed_params.option_map, parsed_params.flags);
@@ -1080,6 +1088,29 @@ std::string LDBCommand::PrintKeyValue(const std::string& key,
   return PrintKeyValue(key, value, is_hex, is_hex);
 }
 
+std::string LDBCommand::PrintKeyValueOrWideColumns(
+    const Slice& key, const Slice& value, const WideColumns& wide_columns,
+    bool is_key_hex, bool is_value_hex) {
+  if (wide_columns.empty() ||
+      (wide_columns.size() == 1 &&
+       WideColumnsHelper::HasDefaultColumn(wide_columns))) {
+    return PrintKeyValue(key.ToString(), value.ToString(), is_key_hex,
+                         is_value_hex);
+  }
+  /*
+  // Sample plaintext output (first column is kDefaultWideColumnName)
+  key_1 ==> :foo attr_name1:bar attr_name2:baz
+
+  // Sample hex output (first column is kDefaultWideColumnName)
+  0x6669727374 ==> :0x68656C6C6F 0x617474725F6E616D6531:0x666F6F
+  */
+  std::ostringstream oss;
+  WideColumnsHelper::DumpWideColumns(wide_columns, oss, is_value_hex);
+  return PrintKeyValue(key.ToString(), oss.str().c_str(), is_key_hex,
+                       false);  // is_value_hex_ is already honored in oss.
+                                // avoid double-hexing it.
+}
+
 std::string LDBCommand::HelpRangeCmdArgs() {
   std::ostringstream str_stream;
   str_stream << " ";
@@ -1884,8 +1915,20 @@ void InternalDumpCommand::DoCommand() {
       std::string key = ikey.DebugString(is_key_hex_);
       Slice value(key_version.value);
       if (!decode_blob_index_ || value_type != kTypeBlobIndex) {
-        fprintf(stdout, "%s => %s\n", key.c_str(),
-                value.ToString(is_value_hex_).c_str());
+        if (value_type == kTypeWideColumnEntity) {
+          std::ostringstream oss;
+          const Status s = WideColumnsHelper::DumpSliceAsWideColumns(
+              value, oss, is_value_hex_);
+          if (!s.ok()) {
+            fprintf(stderr, "%s => error deserializing wide columns\n",
+                    key.c_str());
+          } else {
+            fprintf(stdout, "%s => %s\n", key.c_str(), oss.str().c_str());
+          }
+        } else {
+          fprintf(stdout, "%s => %s\n", key.c_str(),
+                  value.ToString(is_value_hex_).c_str());
+        }
       } else {
         BlobIndex blob_index;
 
@@ -2185,9 +2228,14 @@ void DBDumperCommand::DoDumpCommand() {
       if (is_db_ttl_ && timestamp_) {
         fprintf(stdout, "%s ", TimeToHumanString(rawtime).c_str());
       }
+      // (TODO) TTL Iterator does not support wide columns yet.
       std::string str =
-          PrintKeyValue(iter->key().ToString(), iter->value().ToString(),
-                        is_key_hex_, is_value_hex_);
+          is_db_ttl_
+              ? PrintKeyValue(iter->key().ToString(), iter->value().ToString(),
+                              is_key_hex_, is_value_hex_)
+              : PrintKeyValueOrWideColumns(iter->key(), iter->value(),
+                                           iter->columns(), is_key_hex_,
+                                           is_value_hex_);
       fprintf(stdout, "%s\n", str.c_str());
     }
   }
@@ -2529,6 +2577,16 @@ class InMemoryHandler : public WriteBatch::Handler {
     return Status::OK();
   }
 
+  Status PutEntityCF(uint32_t cf, const Slice& key,
+                     const Slice& value) override {
+    row_ << "PUT_ENTITY(" << cf << ") : ";
+    std::string k = LDBCommand::StringToHex(key.ToString());
+    if (print_values_) {
+      return WideColumnsHelper::DumpSliceAsWideColumns(value, row_, true);
+    }
+    return Status::OK();
+  }
+
   Status MergeCF(uint32_t cf, const Slice& key, const Slice& value) override {
     row_ << "MERGE(" << cf << ") : ";
     commonPutMerge(key, value);
@@ -2786,6 +2844,55 @@ void GetCommand::DoCommand() {
 
 // ----------------------------------------------------------------------------
 
+GetEntityCommand::GetEntityCommand(
+    const std::vector<std::string>& params,
+    const std::map<std::string, std::string>& options,
+    const std::vector<std::string>& flags)
+    : LDBCommand(
+          options, flags, true,
+          BuildCmdLineOptions({ARG_TTL, ARG_HEX, ARG_KEY_HEX, ARG_VALUE_HEX})) {
+  if (params.size() != 1) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "<key> must be specified for the get_entity command");
+  } else {
+    key_ = params.at(0);
+  }
+
+  if (is_key_hex_) {
+    key_ = HexToString(key_);
+  }
+}
+
+void GetEntityCommand::Help(std::string& ret) {
+  ret.append("  ");
+  ret.append(GetEntityCommand::Name());
+  ret.append(" <key>");
+  ret.append(" [--" + ARG_TTL + "]");
+  ret.append("\n");
+}
+
+void GetEntityCommand::DoCommand() {
+  if (!db_) {
+    assert(GetExecuteState().IsFailed());
+    return;
+  }
+  PinnableWideColumns pinnable_wide_columns;
+  Status st = db_->GetEntity(ReadOptions(), GetCfHandle(), key_,
+                             &pinnable_wide_columns);
+  if (st.ok()) {
+    std::ostringstream oss;
+    WideColumnsHelper::DumpWideColumns(pinnable_wide_columns.columns(), oss,
+                                       is_value_hex_);
+    fprintf(stdout, "%s\n", oss.str().c_str());
+  } else {
+    std::stringstream oss;
+    oss << "GetEntity failed: " << st.ToString();
+    exec_state_ = LDBCommandExecuteResult::Failed(oss.str());
+  }
+}
+
+// ----------------------------------------------------------------------------
+
 ApproxSizeCommand::ApproxSizeCommand(
     const std::vector<std::string>& /*params*/,
     const std::map<std::string, std::string>& options,
@@ -3028,30 +3135,22 @@ void ScanCommand::DoCommand() {
       }
     }
 
-    Slice key_slice = it->key();
-
-    std::string formatted_key;
-    if (is_key_hex_) {
-      formatted_key = "0x" + key_slice.ToString(true /* hex */);
-      key_slice = formatted_key;
-    } else if (ldb_options_.key_formatter) {
-      formatted_key = ldb_options_.key_formatter->Format(key_slice);
-      key_slice = formatted_key;
-    }
-
     if (no_value_) {
-      fprintf(stdout, "%.*s\n", static_cast<int>(key_slice.size()),
-              key_slice.data());
-    } else {
-      Slice val_slice = it->value();
-      std::string formatted_value;
-      if (is_value_hex_) {
-        formatted_value = "0x" + val_slice.ToString(true /* hex */);
-        val_slice = formatted_value;
+      std::string key_str = it->key().ToString();
+      if (is_key_hex_) {
+        key_str = StringToHex(key_str);
+      } else if (ldb_options_.key_formatter) {
+        key_str = ldb_options_.key_formatter->Format(key_str);
       }
-      fprintf(stdout, "%.*s : %.*s\n", static_cast<int>(key_slice.size()),
-              key_slice.data(), static_cast<int>(val_slice.size()),
-              val_slice.data());
+      fprintf(stdout, "%s\n", key_str.c_str());
+    } else {
+      std::string str = is_db_ttl_ ? PrintKeyValue(it->key().ToString(),
+                                                   it->value().ToString(),
+                                                   is_key_hex_, is_value_hex_)
+                                   : PrintKeyValueOrWideColumns(
+                                         it->key(), it->value(), it->columns(),
+                                         is_key_hex_, is_value_hex_);
+      fprintf(stdout, "%s\n", str.c_str());
     }
 
     num_keys_scanned++;
@@ -3224,6 +3323,81 @@ void PutCommand::DoCommand() {
 }
 
 void PutCommand::OverrideBaseOptions() {
+  LDBCommand::OverrideBaseOptions();
+  options_.create_if_missing = create_if_missing_;
+}
+
+// ----------------------------------------------------------------------------
+
+PutEntityCommand::PutEntityCommand(
+    const std::vector<std::string>& params,
+    const std::map<std::string, std::string>& options,
+    const std::vector<std::string>& flags)
+    : LDBCommand(options, flags, false,
+                 BuildCmdLineOptions({ARG_TTL, ARG_HEX, ARG_KEY_HEX,
+                                      ARG_VALUE_HEX, ARG_CREATE_IF_MISSING})) {
+  if (params.size() < 2) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "<key> and at least one column <column_name>:<column_value> must be "
+        "specified for the put_entity command");
+  } else {
+    auto iter = params.begin();
+    key_ = *iter;
+    if (is_key_hex_) {
+      key_ = HexToString(key_);
+    }
+    for (++iter; iter != params.end(); ++iter) {
+      auto split = StringSplit(*iter, ':');
+      if (split.size() != 2) {
+        exec_state_ = LDBCommandExecuteResult::Failed(
+            "wide column format needs to be <column_name>:<column_value> (did "
+            "you mean put <key> <value>?)");
+        return;
+      }
+      std::string name(split[0]);
+      std::string value(split[1]);
+      if (is_value_hex_) {
+        name = HexToString(name);
+        value = HexToString(value);
+      }
+      column_names_.push_back(name);
+      column_values_.push_back(value);
+    }
+  }
+  create_if_missing_ = IsFlagPresent(flags_, ARG_CREATE_IF_MISSING);
+}
+
+void PutEntityCommand::Help(std::string& ret) {
+  ret.append("  ");
+  ret.append(PutCommand::Name());
+  ret.append(
+      " <key> <column1_name>:<column1_value> <column2_name>:<column2_value> "
+      "<...>");
+  ret.append(" [--" + ARG_CREATE_IF_MISSING + "]");
+  ret.append(" [--" + ARG_TTL + "]");
+  ret.append("\n");
+}
+
+void PutEntityCommand::DoCommand() {
+  if (!db_) {
+    assert(GetExecuteState().IsFailed());
+    return;
+  }
+  assert(column_names_.size() == column_values_.size());
+  WideColumns columns;
+  for (size_t i = 0; i < column_names_.size(); i++) {
+    WideColumn column(column_names_[i], column_values_[i]);
+    columns.emplace_back(column);
+  }
+  Status st = db_->PutEntity(WriteOptions(), GetCfHandle(), key_, columns);
+  if (st.ok()) {
+    fprintf(stdout, "OK\n");
+  } else {
+    exec_state_ = LDBCommandExecuteResult::Failed(st.ToString());
+  }
+}
+
+void PutEntityCommand::OverrideBaseOptions() {
   LDBCommand::OverrideBaseOptions();
   options_.create_if_missing = create_if_missing_;
 }

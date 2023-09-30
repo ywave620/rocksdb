@@ -179,6 +179,7 @@ default_params = {
     "max_key_len": 3,
     "key_len_percent_dist": "1,30,69",
     "read_fault_one_in": lambda: random.choice([0, 32, 1000]),
+    "write_fault_one_in": 0,
     "open_metadata_write_fault_one_in": lambda: random.choice([0, 0, 8]),
     "open_write_fault_one_in": lambda: random.choice([0, 0, 16]),
     "open_read_fault_one_in": lambda: random.choice([0, 0, 32]),
@@ -216,7 +217,7 @@ default_params = {
     "memtable_max_range_deletions": lambda: random.choice([0] * 6 + [100, 1000]),
     # 0 (disable) is the default and more commonly used value.
     "bottommost_file_compaction_delay": lambda: random.choice([0, 0, 0, 600, 3600, 86400]),
-    "auto_readahead_size" : lambda: random.choice([0, 1]),
+    "auto_readahead_size" : 0,
 }
 
 _TEST_DIR_ENV_VAR = "TEST_TMPDIR"
@@ -374,6 +375,10 @@ cf_consistency_params = {
     # use small value for write_buffer_size so that RocksDB triggers flush
     # more frequently
     "write_buffer_size": 1024 * 1024,
+    # Small write buffer size with more frequent flush has a higher chance
+    # of hitting write error. DB may be stopped if memtable fills up during
+    # auto resume.
+    "write_fault_one_in": 0,
     "enable_pipelined_write": lambda: random.randint(0, 1),
     # Snapshots are used heavily in this test mode, while they are incompatible
     # with compaction filter.
@@ -506,6 +511,9 @@ multiops_txn_default_params = {
     "enable_compaction_filter": 0,
     "create_timestamped_snapshot_one_in": 50,
     "sync_fault_injection": 0,
+    # This test has aggressive flush frequency and small write buffer size.
+    # Disabling write fault to avoid writes being stopped.
+    "write_fault_one_in": 0,
     # PutEntity in transactions is not yet implemented
     "use_put_entity_one_in": 0,
     "use_get_entity": 0,
@@ -665,13 +673,14 @@ def finalize_and_sanitize(src_params):
     if dest_params.get("use_txn") == 1 and dest_params.get("txn_write_policy") != 0:
         dest_params["sync_fault_injection"] = 0
         dest_params["manual_wal_flush_one_in"] = 0
-    # PutEntity is currently incompatible with Merge
+    # Wide column stress tests require FullMergeV3
     if dest_params["use_put_entity_one_in"] != 0:
-        dest_params["use_merge"] = 0
         dest_params["use_full_merge_v1"] = 0
     if dest_params["file_checksum_impl"] == "none":
         dest_params["verify_file_checksums_one_in"] = 0
-
+    if dest_params["write_fault_one_in"] > 0:
+        # background work may be disabled while DB is resuming after some error
+        dest_params["max_write_buffer_number"] = max(dest_params["max_write_buffer_number"], 10)
     return dest_params
 
 

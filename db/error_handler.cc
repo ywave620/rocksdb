@@ -472,6 +472,8 @@ const Status& ErrorHandler::SetBGError(const Status& bg_status,
       ROCKS_LOG_INFO(
           db_options_.info_log,
           "ErrorHandler: Compaction will schedule by itself to resume\n");
+      // Not used in this code path.
+      new_bg_io_err.PermitUncheckedError();
       return bg_error_;
     } else if (BackgroundErrorReason::kFlushNoWAL == reason ||
                BackgroundErrorReason::kManifestWriteNoWAL == reason) {
@@ -653,6 +655,7 @@ const Status& ErrorHandler::StartRecoverFromRetryableBGIOError(
   }
 
   recovery_in_prog_ = true;
+  TEST_SYNC_POINT("StartRecoverFromRetryableBGIOError::in_progress");
   recovery_thread_.reset(
       new port::Thread(&ErrorHandler::RecoverFromRetryableBGIOError, this));
 
@@ -667,14 +670,18 @@ const Status& ErrorHandler::StartRecoverFromRetryableBGIOError(
 // mutex is released.
 void ErrorHandler::RecoverFromRetryableBGIOError() {
   TEST_SYNC_POINT("RecoverFromRetryableBGIOError:BeforeStart");
+  TEST_SYNC_POINT("RecoverFromRetryableBGIOError:BeforeStart2");
   InstrumentedMutexLock l(db_mutex_);
   if (end_recovery_) {
     EventHelpers::NotifyOnErrorRecoveryEnd(db_options_.listeners, bg_error_,
                                            Status::ShutdownInProgress(),
                                            db_mutex_);
+
+    recovery_in_prog_ = false;
     return;
   }
   DBRecoverContext context = recover_context_;
+  context.flush_after_recovery = true;
   int resume_count = db_options_.max_bgerror_resume_count;
   uint64_t wait_interval = db_options_.bgerror_resume_retry_interval;
   uint64_t retry_count = 0;
@@ -684,6 +691,7 @@ void ErrorHandler::RecoverFromRetryableBGIOError() {
       EventHelpers::NotifyOnErrorRecoveryEnd(db_options_.listeners, bg_error_,
                                              Status::ShutdownInProgress(),
                                              db_mutex_);
+      recovery_in_prog_ = false;
       return;
     }
     TEST_SYNC_POINT("RecoverFromRetryableBGIOError:BeforeResume0");

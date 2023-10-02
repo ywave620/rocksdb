@@ -25,6 +25,7 @@
 #include "rocksdb/wal_filter.h"
 #include "test_util/sync_point.h"
 #include "util/rate_limiter_impl.h"
+#include "util/string_util.h"
 #include "util/udt_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -141,13 +142,6 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
 
   if (!result.wal_dir.empty() && result.wal_dir.back() == '/') {
     result.wal_dir = result.wal_dir.substr(0, result.wal_dir.size() - 1);
-  }
-
-  if (result.compaction_readahead_size == 0) {
-    if (result.use_direct_reads) {
-      TEST_SYNC_POINT_CALLBACK("SanitizeOptions:direct_io", nullptr);
-    }
-    result.compaction_readahead_size = 1024 * 1024 * 2;
   }
 
   // Force flush on DB open if 2PC is enabled, since with 2PC we have no
@@ -298,6 +292,15 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
         "writes in direct IO require writable_file_max_buffer_size > 0");
   }
 
+  if (db_options.daily_offpeak_time_utc != "") {
+    int start_time, end_time;
+    if (!TryParseTimeRangeString(db_options.daily_offpeak_time_utc, start_time,
+                                 end_time)) {
+      return Status::InvalidArgument(
+          "daily_offpeak_time_utc should be set in the format HH:mm-HH:mm "
+          "(e.g. 04:30-07:30)");
+    }
+  }
   return Status::OK();
 }
 
@@ -1305,7 +1308,7 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
           flushed = true;
 
           cfd->CreateNewMemtable(*cfd->GetLatestMutableCFOptions(),
-                                 *next_sequence);
+                                 *next_sequence - 1);
         }
       }
     }
@@ -1656,7 +1659,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           TableFileCreationReason::kRecovery, 0 /* oldest_key_time */,
           0 /* file_creation_time */, db_id_, db_session_id_,
           0 /* target_file_size */, meta.fd.GetNumber());
-      SeqnoToTimeMapping empty_seqno_time_mapping;
+      SeqnoToTimeMapping empty_seqno_to_time_mapping;
       Version* version = cfd->current();
       version->Ref();
       const ReadOptions read_option(Env::IOActivity::kDBOpen);
@@ -1668,7 +1671,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           snapshot_seqs, earliest_write_conflict_snapshot, kMaxSequenceNumber,
           snapshot_checker, paranoid_file_checks, cfd->internal_stats(), &io_s,
           io_tracer_, BlobFileCreationReason::kRecovery,
-          empty_seqno_time_mapping, &event_logger_, job_id, Env::IO_HIGH,
+          empty_seqno_to_time_mapping, &event_logger_, job_id, Env::IO_HIGH,
           nullptr /* table_properties */, write_hint,
           nullptr /*full_history_ts_low*/, &blob_callback_, version,
           &num_input_entries);
@@ -1721,6 +1724,22 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
 
     for (const auto& blob : blob_file_additions) {
       edit->AddBlobFile(blob);
+    }
+
+    // For UDT in memtable only feature, move up the cutoff timestamp whenever
+    // a flush happens.
+    const Comparator* ucmp = cfd->user_comparator();
+    size_t ts_sz = ucmp->timestamp_size();
+    if (ts_sz > 0 && !cfd->ioptions()->persist_user_defined_timestamps) {
+      Slice mem_newest_udt = mem->GetNewestUDT();
+      std::string full_history_ts_low = cfd->GetFullHistoryTsLow();
+      if (full_history_ts_low.empty() ||
+          ucmp->CompareTimestamp(mem_newest_udt, full_history_ts_low) >= 0) {
+        std::string new_full_history_ts_low;
+        GetFullHistoryTsLowFromU64CutoffTs(&mem_newest_udt,
+                                           &new_full_history_ts_low);
+        edit->SetFullHistoryTsLow(new_full_history_ts_low);
+      }
     }
   }
 

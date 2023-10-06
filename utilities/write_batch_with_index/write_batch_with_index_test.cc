@@ -1654,7 +1654,7 @@ TEST_P(WriteBatchWithIndexTest, TestBoundsCheckingInDeltaIterator) {
 
   ReadOptions ro;
 
-  auto checkOnlyBIsVisible = [&]() {
+  auto check_only_b_is_visible = [&]() {
     std::unique_ptr<Iterator> iter(batch_->NewIteratorWithBase(
         db_->DefaultColumnFamily(), new KVIter(&empty_map), &ro));
 
@@ -1685,10 +1685,11 @@ TEST_P(WriteBatchWithIndexTest, TestBoundsCheckingInDeltaIterator) {
     iter->SeekForPrev(Slice("a"));
     ASSERT_FALSE(iter->Valid());
 
-    iter->SeekForPrev(Slice("a.1")); // a non-existent key that is smaller than "b"
+    iter->SeekForPrev(
+        Slice("a.1"));  // a non-existent key that is smaller than "b"
     ASSERT_FALSE(iter->Valid());
 
-    iter->Seek(Slice("b.1")); // a non-existent key that is greater than "b"
+    iter->Seek(Slice("b.1"));  // a non-existent key that is greater than "b"
     ASSERT_FALSE(iter->Valid());
 
     delete ro.iterate_lower_bound;
@@ -1697,18 +1698,19 @@ TEST_P(WriteBatchWithIndexTest, TestBoundsCheckingInDeltaIterator) {
 
   ro.iterate_lower_bound = new Slice("b");
   ro.iterate_upper_bound = new Slice("c");
-  checkOnlyBIsVisible();
+  check_only_b_is_visible();
 
   ro.iterate_lower_bound = new Slice("a.1");
   ro.iterate_upper_bound = new Slice("c");
-  checkOnlyBIsVisible();
+  check_only_b_is_visible();
 
   ro.iterate_lower_bound = new Slice("b");
   ro.iterate_upper_bound = new Slice("b.2");
-  checkOnlyBIsVisible();
+  check_only_b_is_visible();
 }
 
-TEST_P(WriteBatchWithIndexTest, TestBoundsCheckingInSeekToFirstAndLastOfDeltaIterator) {
+TEST_P(WriteBatchWithIndexTest,
+       TestBoundsCheckingInSeekToFirstAndLastOfDeltaIterator) {
   Status s = OpenDB();
   ASSERT_OK(s);
   KVMap empty_map;
@@ -1716,7 +1718,7 @@ TEST_P(WriteBatchWithIndexTest, TestBoundsCheckingInSeekToFirstAndLastOfDeltaIte
   ASSERT_OK(batch_->Put("c", "cc"));
 
   ReadOptions ro;
-  auto checkNothingVisible = [&]() {
+  auto check_nothing_visible = [&]() {
     std::unique_ptr<Iterator> iter(batch_->NewIteratorWithBase(
         db_->DefaultColumnFamily(), new KVIter(&empty_map), &ro));
     iter->SeekToFirst();
@@ -1730,11 +1732,11 @@ TEST_P(WriteBatchWithIndexTest, TestBoundsCheckingInSeekToFirstAndLastOfDeltaIte
 
   ro.iterate_lower_bound = new Slice("b");
   ro.iterate_upper_bound = new Slice("c");
-  checkNothingVisible();
+  check_nothing_visible();
 
   ro.iterate_lower_bound = new Slice("d");
   ro.iterate_upper_bound = new Slice("e");
-  checkNothingVisible();
+  check_nothing_visible();
 }
 
 TEST_P(WriteBatchWithIndexTest, SavePointTest) {

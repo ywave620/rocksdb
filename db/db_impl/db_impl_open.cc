@@ -299,6 +299,9 @@ Status DBImpl::ValidateOptions(const DBOptions& db_options) {
       return Status::InvalidArgument(
           "daily_offpeak_time_utc should be set in the format HH:mm-HH:mm "
           "(e.g. 04:30-07:30)");
+    } else if (start_time == end_time) {
+      return Status::InvalidArgument(
+          "start_time and end_time cannot be the same");
     }
   }
   return Status::OK();
@@ -2066,7 +2069,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
           // missing column family, create it
           ColumnFamilyHandle* handle = nullptr;
           impl->mutex_.Unlock();
-          s = impl->CreateColumnFamily(cf.options, cf.name, &handle);
+          // NOTE: the work normally done in WrapUpCreateColumnFamilies will
+          // be done separately below.
+          s = impl->CreateColumnFamilyImpl(cf.options, cf.name, &handle);
           impl->mutex_.Lock();
           if (s.ok()) {
             handles->push_back(handle);

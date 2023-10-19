@@ -78,6 +78,46 @@ class OptimisticTransactionTest
   void Open() { OpenImpl(options, occ_opts, dbname, &txn_db); }
 };
 
+
+
+TEST_P(OptimisticTransactionTest, WriteStallTest) {
+  WriteBufferManager wbm(500 * 1024 * 1024, nullptr, true);
+
+  std::vector<std::unique_ptr<rocksdb::OptimisticTransactionDB>> dbs;
+
+  for (int i = 0; i < 100; i++) {
+    auto dbname2 = test::PerThreadDBPath("optimistic_transaction_testdb" +
+                                   std::to_string(i));
+    options.create_if_missing = true;
+    options.write_buffer_manager.reset(&wbm);
+
+    ColumnFamilyOptions cf_options(options);
+    std::vector<ColumnFamilyDescriptor> column_families;
+    std::vector<ColumnFamilyHandle*> handles;
+    column_families.push_back(
+        ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
+    OptimisticTransactionDB* raw_txn_db = nullptr;
+    Status s = OptimisticTransactionDB::Open(
+        options, occ_opts, dbname2, column_families, &handles, &raw_txn_db);
+    ASSERT_OK(s);
+    ASSERT_NE(raw_txn_db, nullptr);
+    dbs.push_back(std::move(std::unique_ptr<OptimisticTransactionDB>(raw_txn_db)));
+    ASSERT_EQ(handles.size(), 1);
+    delete handles[0];
+  }
+
+  WriteOptions write_options;
+  std::string value = std::string(1024*1024, '.');
+
+  // write to 100 DB in the same thread
+  for (auto& table : dbs) {
+    std::cout << "Writing to " << table->GetName() << std::endl;
+    for (int i = 0; i < 100; i++) {
+      ASSERT_OK(table->Put(write_options, std::to_string(i), value));
+    }
+  }
+}
+
 TEST_P(OptimisticTransactionTest, SuccessTest) {
   WriteOptions write_options;
   ReadOptions read_options;

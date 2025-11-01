@@ -372,6 +372,7 @@ MOCK_LIB_SOURCES =                                              \
 
 BENCH_LIB_SOURCES =                                             \
   tools/db_bench_tool.cc                                        \
+  tools/open_loop_workload.cc                                   \
   tools/simulated_hybrid_file_system.cc                         \
 
 CACHE_BENCH_LIB_SOURCES =					\

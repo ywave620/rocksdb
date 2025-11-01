@@ -91,6 +91,7 @@
 #include "utilities/merge_operators/bytesxor.h"
 #include "utilities/merge_operators/sortlist.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
+#include "tools/open_loop_workload.h"
 
 #ifdef MEMKIND
 #include "memory/memkind_kmem_allocator.h"
@@ -1597,6 +1598,55 @@ DEFINE_uint64(
     "If non-zero, db_bench will rate-limit the reads from RocksDB. This "
     "is the global rate in ops/second.");
 
+// Open-loop workload flags
+DEFINE_double(arrival_rate, 0.0,
+             "Target arrival rate in operations per second for open-loop workload. "
+             "When set to 0 (default), uses closed-loop mode. "
+             "When > 0, enables open-loop mode with Poisson arrival process.");
+
+DEFINE_string(variance_pattern, "none",
+             "Variance pattern for arrival rate: "
+             "none, sine, random_spikes, step, poisson");
+
+// Variance pattern specific parameters
+DEFINE_double(variance_sine_amplitude, 0.5,
+             "Amplitude for sine wave variance as fraction of base rate (0.0-1.0). "
+             "Rate varies as: base_rate * (1 + amplitude * sin(2*pi*t/period))");
+
+DEFINE_double(variance_sine_period_sec, 60.0,
+             "Period of sine wave oscillation in seconds");
+
+DEFINE_double(variance_spike_multiplier, 3.0,
+             "Peak rate multiplier for random spike pattern");
+
+DEFINE_double(variance_spike_probability, 0.05,
+             "Probability of spike occurring (checked every 100ms)");
+
+DEFINE_double(variance_spike_duration_ms, 100.0,
+             "Duration of each spike in milliseconds");
+
+DEFINE_double(variance_step_high_multiplier, 2.0,
+             "High rate multiplier for step function pattern");
+
+DEFINE_double(variance_step_low_multiplier, 0.5,
+             "Low rate multiplier for step function pattern");
+
+DEFINE_double(variance_step_period_sec, 30.0,
+             "Period for step function in seconds (high/low switch time)");
+
+DEFINE_double(variance_poisson_cv, 0.3,
+             "Coefficient of variation for Poisson variance (stdev/mean)");
+
+DEFINE_int32(open_loop_queue_capacity, 10000,
+            "Maximum number of operations that can be queued in open-loop mode. "
+            "When queue is full, oldest operations are dropped.");
+
+DEFINE_bool(open_loop_drain_queue, true,
+           "Whether to drain the queue after stopping producers in open-loop mode.");
+
+DEFINE_bool(open_loop_separate_read_write_queues, true,
+           "Use separate queues for reads and writes in open-loop mode.");
+
 DEFINE_uint64(max_compaction_bytes,
               ROCKSDB_NAMESPACE::Options().max_compaction_bytes,
               "Max bytes allowed in one compaction");
@@ -2164,19 +2214,29 @@ class ReporterAgent {
   bool stop_;
 };
 
-enum OperationType : unsigned char {
-  kRead = 0,
-  kWrite,
-  kDelete,
-  kSeek,
-  kMerge,
-  kUpdate,
-  kCompress,
-  kUncompress,
-  kCrc,
-  kHash,
-  kOthers
-};
+// Use the OperationType from open_loop_workload.h
+using ROCKSDB_NAMESPACE::OperationType;
+using ROCKSDB_NAMESPACE::kRead;
+using ROCKSDB_NAMESPACE::kWrite;
+using ROCKSDB_NAMESPACE::kDelete;
+using ROCKSDB_NAMESPACE::kSeek;
+using ROCKSDB_NAMESPACE::kMerge;
+using ROCKSDB_NAMESPACE::kUpdate;
+using ROCKSDB_NAMESPACE::kCompress;
+using ROCKSDB_NAMESPACE::kUncompress;
+using ROCKSDB_NAMESPACE::kCrc;
+using ROCKSDB_NAMESPACE::kHash;
+using ROCKSDB_NAMESPACE::kOthers;
+
+// Use open-loop workload components
+using ROCKSDB_NAMESPACE::Operation;
+using ROCKSDB_NAMESPACE::ArrivalRateController;
+using ROCKSDB_NAMESPACE::ConstantRateController;
+using ROCKSDB_NAMESPACE::SineVarianceController;
+using ROCKSDB_NAMESPACE::RandomSpikeController;
+using ROCKSDB_NAMESPACE::StepFunctionController;
+using ROCKSDB_NAMESPACE::PoissonVarianceController;
+using ROCKSDB_NAMESPACE::OperationQueue;
 
 static std::unordered_map<OperationType, std::string, std::hash<unsigned char>>
     OperationTypeString = {{kRead, "read"},         {kWrite, "write"},
@@ -2207,6 +2267,13 @@ class Stats {
   std::string message_;
   bool exclude_from_merge_;
   ReporterAgent* reporter_agent_;  // does not own
+  
+  // Open-loop specific statistics
+  std::shared_ptr<HistogramImpl> queuing_latency_hist_;  // t_start_execution - t_schedule
+  std::shared_ptr<HistogramImpl> execution_latency_hist_; // t_finish - t_start_execution
+  uint64_t open_loop_ops_scheduled_;  // Operations scheduled by producer
+  uint64_t open_loop_ops_dropped_;    // Operations dropped due to queue overflow
+  
   friend class CombinedStats;
 
  public:
@@ -2232,6 +2299,12 @@ class Stats {
     message_.clear();
     // When set, stats from this thread won't be merged with others.
     exclude_from_merge_ = false;
+    
+    // Initialize open-loop statistics
+    queuing_latency_hist_ = nullptr;
+    execution_latency_hist_ = nullptr;
+    open_loop_ops_scheduled_ = 0;
+    open_loop_ops_dropped_ = 0;
   }
 
   void Merge(const Stats& other) {
@@ -2442,6 +2515,39 @@ class Stats {
   }
 
   void AddBytes(int64_t n) { bytes_ += n; }
+  
+  // Open-loop specific methods
+  void RecordOpenLoopLatencies(uint64_t schedule_time, uint64_t start_execution_time,
+                                uint64_t finish_time) {
+    if (!queuing_latency_hist_) {
+      queuing_latency_hist_ = std::make_shared<HistogramImpl>();
+    }
+    if (!execution_latency_hist_) {
+      execution_latency_hist_ = std::make_shared<HistogramImpl>();
+    }
+    
+    uint64_t queuing_micros = start_execution_time - schedule_time;
+    uint64_t execution_micros = finish_time - start_execution_time;
+    
+    queuing_latency_hist_->Add(queuing_micros);
+    execution_latency_hist_->Add(execution_micros);
+  }
+  
+  void IncrementOpenLoopScheduled() {
+    open_loop_ops_scheduled_++;
+  }
+  
+  void IncrementOpenLoopDropped() {
+    open_loop_ops_dropped_++;
+  }
+  
+  uint64_t GetOpenLoopScheduled() const {
+    return open_loop_ops_scheduled_;
+  }
+  
+  uint64_t GetOpenLoopDropped() const {
+    return open_loop_ops_dropped_;
+  }
 
   void Report(const Slice& name) {
     // Pretend at least one op was done in case we are running a benchmark
@@ -2475,6 +2581,23 @@ class Stats {
                 it->second->ToString().c_str());
       }
     }
+    
+    // Report open-loop specific statistics
+    if (queuing_latency_hist_ && queuing_latency_hist_->num() > 0) {
+      fprintf(stdout, "Queuing latency (schedule to execution start):\n%s\n",
+              queuing_latency_hist_->ToString().c_str());
+    }
+    if (execution_latency_hist_ && execution_latency_hist_->num() > 0) {
+      fprintf(stdout, "Execution latency (execution start to finish):\n%s\n",
+              execution_latency_hist_->ToString().c_str());
+    }
+    if (open_loop_ops_scheduled_ > 0) {
+      fprintf(stdout, "Open-loop: scheduled %" PRIu64 ", dropped %" PRIu64 
+              " (%.2f%% drop rate)\n",
+              open_loop_ops_scheduled_, open_loop_ops_dropped_,
+              100.0 * open_loop_ops_dropped_ / open_loop_ops_scheduled_);
+    }
+    
     if (FLAGS_report_file_operations) {
       auto* counted_fs =
           FLAGS_env->GetFileSystem()->CheckedCast<CountedFileSystem>();
@@ -2699,6 +2822,57 @@ struct ThreadState {
   explicit ThreadState(int index, int my_seed)
       : tid(index), rand(*seed_base + my_seed) {}
 };
+
+// ============================================================================
+// Open-Loop Producer State
+// ============================================================================
+
+// State for producer thread
+struct ProducerState {
+  Random64 rand;  // Own RNG state
+  void* key_gen;  // For writes with UNIQUE_RANDOM (KeyGenerator* cast inside Benchmark methods)
+  uint64_t operations_generated;
+  Stats stats;  // Track producer statistics
+  
+  explicit ProducerState(int seed) 
+      : rand(*seed_base + seed), key_gen(nullptr), operations_generated(0) {
+    stats.Start(-1);  // -1 indicates producer
+  }
+  
+  ~ProducerState() {
+    // Clean up KeyGenerator if allocated
+    if (key_gen != nullptr) {
+      // Note: This assumes KeyGenerator is available in scope
+      // In practice, cleanup happens in WriteProducer
+      key_gen = nullptr;
+    }
+  }
+};
+
+// Shared state for open-loop execution
+struct OpenLoopSharedState {
+  std::unique_ptr<OperationQueue> read_queue;
+  std::unique_ptr<OperationQueue> write_queue;
+  std::unique_ptr<ArrivalRateController> rate_controller;
+  std::atomic<bool> stop_producers;
+  std::atomic<bool> stop_consumers;
+  
+  port::Mutex producer_mu;
+  port::CondVar producer_cv;
+  int num_producers;
+  int producers_started;
+  
+  OpenLoopSharedState() 
+      : stop_producers(false),
+        stop_consumers(false),
+        producer_cv(&producer_mu),
+        num_producers(0),
+        producers_started(0) {}
+};
+
+// ============================================================================
+// End of Open-Loop Producer State
+// ============================================================================
 
 class Duration {
  public:
@@ -3232,6 +3406,9 @@ class Benchmark {
   }
 
  public:
+  // Write mode for benchmark operations
+  enum WriteMode { RANDOM, SEQUENTIAL, UNIQUE_RANDOM };
+  
   Benchmark()
       : cache_(NewCache(FLAGS_cache_size)),
         compressed_cache_(NewCache(FLAGS_compressed_cache_size)),
@@ -3885,7 +4062,27 @@ class Benchmark {
         }
 
         for (int i = 0; i < num_warmup; i++) {
-          RunBenchmark(num_threads, name, method);
+          if (FLAGS_arrival_rate > 0 && 
+              (name == "readrandom" || name == "fillrandom" || name == "overwrite")) {
+            // Determine operation type and write mode
+            OperationType op_type = kOthers;
+            Benchmark::WriteMode write_mode_val = RANDOM;
+            if (name == "readrandom") {
+              op_type = kRead;
+            } else if (name == "fillrandom") {
+              op_type = kWrite;
+              write_mode_val = Benchmark::RANDOM;
+            } else if (name == "overwrite") {
+              op_type = kWrite;
+              write_mode_val = Benchmark::RANDOM;
+            }
+            RunOpenLoopBenchmark(num_threads, name, op_type, write_mode_val);
+          } else {
+            if (FLAGS_arrival_rate > 0) {
+              fprintf(stderr, "Warning: Open-loop mode not supported for %s, falling back to closed-loop\n", name.c_str());
+            }
+            RunBenchmark(num_threads, name, method);
+          }
         }
 
         if (num_repeat > 1) {
@@ -3894,7 +4091,28 @@ class Benchmark {
 
         CombinedStats combined_stats;
         for (int i = 0; i < num_repeat; i++) {
-          Stats stats = RunBenchmark(num_threads, name, method);
+          Stats stats;
+          if (FLAGS_arrival_rate > 0 && 
+              (name == "readrandom" || name == "fillrandom" || name == "overwrite")) {
+            // Determine operation type and write mode
+            OperationType op_type = kOthers;
+            Benchmark::WriteMode write_mode_val = RANDOM;
+            if (name == "readrandom") {
+              op_type = kRead;
+            } else if (name == "fillrandom") {
+              op_type = kWrite;
+              write_mode_val = Benchmark::RANDOM;
+            } else if (name == "overwrite") {
+              op_type = kWrite;
+              write_mode_val = Benchmark::RANDOM;
+            }
+            stats = RunOpenLoopBenchmark(num_threads, name, op_type, write_mode_val);
+          } else {
+            if (FLAGS_arrival_rate > 0 && i == 0) {
+              fprintf(stderr, "Warning: Open-loop mode not supported for %s, falling back to closed-loop\n", name.c_str());
+            }
+            stats = RunBenchmark(num_threads, name, method);
+          }
           combined_stats.AddStats(stats);
           if (FLAGS_confidence_interval_only) {
             combined_stats.ReportWithConfidenceIntervals(name);
@@ -3992,6 +4210,249 @@ class Benchmark {
         shared->cv.SignalAll();
       }
     }
+  }
+
+  // Helper method to create arrival rate controller based on variance pattern
+  std::unique_ptr<ArrivalRateController> CreateArrivalRateController() {
+    SystemClock* clock = FLAGS_env->GetSystemClock().get();
+    std::string pattern = FLAGS_variance_pattern;
+    
+    if (pattern == "none") {
+      return std::unique_ptr<ArrivalRateController>(
+          new ConstantRateController(FLAGS_arrival_rate, clock));
+    } else if (pattern == "sine") {
+      return std::unique_ptr<ArrivalRateController>(
+          new SineVarianceController(FLAGS_arrival_rate, clock,
+                                    FLAGS_variance_sine_amplitude,
+                                    FLAGS_variance_sine_period_sec));
+    } else if (pattern == "random_spikes") {
+      return std::unique_ptr<ArrivalRateController>(
+          new RandomSpikeController(FLAGS_arrival_rate, clock,
+                                   FLAGS_variance_spike_multiplier,
+                                   FLAGS_variance_spike_probability,
+                                   FLAGS_variance_spike_duration_ms));
+    } else if (pattern == "step") {
+      return std::unique_ptr<ArrivalRateController>(
+          new StepFunctionController(FLAGS_arrival_rate, clock,
+                                    FLAGS_variance_step_high_multiplier,
+                                    FLAGS_variance_step_low_multiplier,
+                                    FLAGS_variance_step_period_sec));
+    } else if (pattern == "poisson") {
+      return std::unique_ptr<ArrivalRateController>(
+          new PoissonVarianceController(FLAGS_arrival_rate, clock,
+                                       FLAGS_variance_poisson_cv));
+    } else {
+      fprintf(stderr, "Unknown variance pattern: %s\n", pattern.c_str());
+      fprintf(stderr, "Using constant rate (none)\n");
+      return std::unique_ptr<ArrivalRateController>(
+          new ConstantRateController(FLAGS_arrival_rate, clock));
+    }
+  }
+  
+  // Run benchmark in open-loop mode with producer-consumer architecture
+  Stats RunOpenLoopBenchmark(int n_consumers, Slice name,
+                             OperationType op_type,
+                             WriteMode write_mode = RANDOM) {
+    (void)write_mode;  // May be unused for read-only benchmarks
+    fprintf(stdout, "Running open-loop benchmark: %s\n", name.ToString().c_str());
+    fprintf(stdout, "  Arrival rate: %.0f ops/sec\n", FLAGS_arrival_rate);
+    fprintf(stdout, "  Variance pattern: %s\n", FLAGS_variance_pattern.c_str());
+    fprintf(stdout, "  Consumer threads: %d\n", n_consumers);
+    fprintf(stdout, "  Queue capacity: %d\n", FLAGS_open_loop_queue_capacity);
+    
+    // Create open-loop shared state
+    OpenLoopSharedState open_loop_state;
+    SystemClock* clock = FLAGS_env->GetSystemClock().get();
+    
+    // Create rate controller
+    open_loop_state.rate_controller = CreateArrivalRateController();
+    
+    // Create queues based on operation type
+    if (op_type == kRead || op_type == kOthers) {
+      open_loop_state.read_queue.reset(
+          new OperationQueue(FLAGS_open_loop_queue_capacity));
+    }
+    if (op_type == kWrite || op_type == kOthers) {
+      open_loop_state.write_queue.reset(
+          new OperationQueue(FLAGS_open_loop_queue_capacity));
+    }
+    
+    // Determine number of producers (1 for pure read/write, 1 or 2 for mixed)
+    bool has_reads = (op_type == kRead || op_type == kOthers);
+    bool has_writes = (op_type == kWrite || op_type == kOthers);
+    int n_producers = (has_reads ? 1 : 0) + (has_writes ? 1 : 0);
+    open_loop_state.num_producers = n_producers;
+    
+    // Create producer states
+    std::vector<std::unique_ptr<ProducerState>> producer_states;
+    std::vector<std::unique_ptr<port::Thread>> producer_threads;
+    
+    int producer_seed = total_thread_count_;
+    
+    // Start read producer if needed
+    if (has_reads) {
+      auto read_producer_state = std::unique_ptr<ProducerState>(
+          new ProducerState(producer_seed++));
+      auto read_producer_thread = std::unique_ptr<port::Thread>(
+          new port::Thread([this, &read_producer_state, &open_loop_state]() {
+            this->ReadProducer(read_producer_state.get(), &open_loop_state);
+          }));
+      producer_states.push_back(std::move(read_producer_state));
+      producer_threads.push_back(std::move(read_producer_thread));
+    }
+    
+    // Start write producer if needed
+    if (has_writes) {
+      auto write_producer_state = std::unique_ptr<ProducerState>(
+          new ProducerState(producer_seed++));
+      auto write_producer_thread = std::unique_ptr<port::Thread>(
+          new port::Thread([this, &write_producer_state, &open_loop_state, write_mode]() {
+            this->WriteProducer(write_producer_state.get(), &open_loop_state, write_mode);
+          }));
+      producer_states.push_back(std::move(write_producer_state));
+      producer_threads.push_back(std::move(write_producer_thread));
+    }
+    
+    // Wait for producers to start
+    {
+      MutexLock l(&open_loop_state.producer_mu);
+      while (open_loop_state.producers_started < n_producers) {
+        open_loop_state.producer_cv.Wait();
+      }
+    }
+    
+    // Create consumer threads
+    std::vector<std::unique_ptr<ThreadState>> consumer_states;
+    std::vector<std::unique_ptr<RandomGenerator>> value_generators;
+    std::vector<std::unique_ptr<port::Thread>> consumer_threads;
+    
+    for (int i = 0; i < n_consumers; i++) {
+      total_thread_count_++;
+      auto consumer_state = std::unique_ptr<ThreadState>(
+          new ThreadState(i, total_thread_count_));
+      consumer_state->stats.Start(i);
+      
+      auto value_gen = std::unique_ptr<RandomGenerator>(new RandomGenerator());
+      
+      // Consumer thread lambda
+      auto consumer_thread = std::unique_ptr<port::Thread>(
+          new port::Thread([this, &consumer_state, &value_gen, &open_loop_state,
+                           has_reads, has_writes]() {
+            Operation op;
+            while (true) {
+              // Try to dequeue from read queue
+              if (has_reads && open_loop_state.read_queue->Dequeue(&op)) {
+                this->ExecuteReadOperation(op, consumer_state.get(), value_gen.get());
+                continue;
+              }
+              
+              // Try to dequeue from write queue
+              if (has_writes && open_loop_state.write_queue->Dequeue(&op)) {
+                this->ExecuteWriteOperation(op, consumer_state.get(), value_gen.get());
+                continue;
+              }
+              
+              // Both queues stopped
+              if (open_loop_state.stop_consumers.load()) {
+                break;
+              }
+            }
+            consumer_state->stats.Stop();
+          }));
+      
+      consumer_states.push_back(std::move(consumer_state));
+      value_generators.push_back(std::move(value_gen));
+      consumer_threads.push_back(std::move(consumer_thread));
+    }
+    
+    // Run for specified duration
+    if (FLAGS_duration > 0) {
+      fprintf(stdout, "Running for %d seconds...\n", FLAGS_duration);
+      FLAGS_env->SleepForMicroseconds(FLAGS_duration * 1000000);
+    } else {
+      // TODO: Support running until N operations complete
+      fprintf(stdout, "Running for 60 seconds (duration not specified)...\n");
+      FLAGS_env->SleepForMicroseconds(60 * 1000000);
+    }
+    
+    // Stop producers
+    fprintf(stdout, "Stopping producers...\n");
+    open_loop_state.stop_producers.store(true);
+    for (auto& thread : producer_threads) {
+      thread->join();
+    }
+    
+    // Optionally drain queues
+    if (FLAGS_open_loop_drain_queue) {
+      fprintf(stdout, "Draining queues...\n");
+      int drain_timeout_sec = 60;
+      uint64_t drain_start = clock->NowMicros();
+      while (clock->NowMicros() - drain_start < drain_timeout_sec * 1000000ULL) {
+        bool queues_empty = true;
+        if (has_reads && open_loop_state.read_queue->GetDepth() > 0) {
+          queues_empty = false;
+        }
+        if (has_writes && open_loop_state.write_queue->GetDepth() > 0) {
+          queues_empty = false;
+        }
+        if (queues_empty) {
+          break;
+        }
+        FLAGS_env->SleepForMicroseconds(100000);  // 100ms
+      }
+    }
+    
+    // Stop consumers
+    fprintf(stdout, "Stopping consumers...\n");
+    open_loop_state.stop_consumers.store(true);
+    if (has_reads) {
+      open_loop_state.read_queue->Stop();
+    }
+    if (has_writes) {
+      open_loop_state.write_queue->Stop();
+    }
+    
+    for (auto& thread : consumer_threads) {
+      thread->join();
+    }
+    
+    // Collect statistics
+    Stats merge_stats;
+    for (int i = 0; i < n_consumers; i++) {
+      merge_stats.Merge(consumer_states[i]->stats);
+    }
+    
+    // Add producer statistics
+    for (size_t i = 0; i < producer_states.size(); i++) {
+      merge_stats.IncrementOpenLoopScheduled();  // Mark that this is open-loop
+      uint64_t scheduled = producer_states[i]->stats.GetOpenLoopScheduled();
+      uint64_t dropped = producer_states[i]->stats.GetOpenLoopDropped();
+      for (uint64_t j = 0; j < scheduled; j++) {
+        merge_stats.IncrementOpenLoopScheduled();
+      }
+      for (uint64_t j = 0; j < dropped; j++) {
+        merge_stats.IncrementOpenLoopDropped();
+      }
+    }
+    
+    // Add queue statistics
+    if (has_reads) {
+      fprintf(stdout, "Read queue: enqueued=%" PRIu64 " dequeued=%" PRIu64 
+              " dropped=%" PRIu64 "\n",
+              open_loop_state.read_queue->GetEnqueueCount(),
+              open_loop_state.read_queue->GetDequeueCount(),
+              open_loop_state.read_queue->GetDropCount());
+    }
+    if (has_writes) {
+      fprintf(stdout, "Write queue: enqueued=%" PRIu64 " dequeued=%" PRIu64 
+              " dropped=%" PRIu64 "\n",
+              open_loop_state.write_queue->GetEnqueueCount(),
+              open_loop_state.write_queue->GetDequeueCount(),
+              open_loop_state.write_queue->GetDropCount());
+    }
+    
+    merge_stats.Report(name);
+    return merge_stats;
   }
 
   Stats RunBenchmark(int n, Slice name,
@@ -5053,8 +5514,6 @@ class Benchmark {
     }
   }
 
-  enum WriteMode { RANDOM, SEQUENTIAL, UNIQUE_RANDOM };
-
   void WriteSeqDeterministic(ThreadState* thread) {
     DoDeterministicCompact(thread, open_options_.compaction_style, SEQUENTIAL);
   }
@@ -6091,6 +6550,229 @@ class Benchmark {
     }
     return key_rand;
   }
+  
+  // ============================================================================
+  // Open-Loop Producer and Consumer Methods
+  // ============================================================================
+  
+  // Producer thread for generating read operations
+  void ReadProducer(ProducerState* state, OpenLoopSharedState* open_loop_state) {
+    SystemClock* clock = FLAGS_env->GetSystemClock().get();
+    OperationQueue* queue = open_loop_state->read_queue.get();
+    ArrivalRateController* rate_ctrl = open_loop_state->rate_controller.get();
+    
+    // Signal that producer has started
+    {
+      MutexLock l(&open_loop_state->producer_mu);
+      open_loop_state->producers_started++;
+      if (open_loop_state->producers_started >= open_loop_state->num_producers) {
+        open_loop_state->producer_cv.SignalAll();
+      }
+    }
+    
+    while (!open_loop_state->stop_producers.load()) {
+      // Wait for next arrival
+      uint64_t wait_micros = rate_ctrl->GetNextInterArrivalMicros();
+      if (wait_micros > 0) {
+        FLAGS_env->SleepForMicroseconds(static_cast<int>(wait_micros));
+      }
+      
+      if (open_loop_state->stop_producers.load()) {
+        break;
+      }
+      
+      // Generate operation
+      Operation op;
+      op.key = GetRandomKey(&state->rand);
+      op.type = kRead;
+      op.schedule_time = clock->NowMicros();
+      op.db_index = static_cast<int>(state->rand.Next() % 
+                                     (multi_dbs_.empty() ? 1 : multi_dbs_.size()));
+      op.cf_index = 0;  // Can be extended for multi-CF support
+      
+      // Enqueue
+      bool success = queue->Enqueue(op);
+      state->operations_generated++;
+      state->stats.IncrementOpenLoopScheduled();
+      
+      if (!success) {
+        state->stats.IncrementOpenLoopDropped();
+      }
+    }
+    
+    state->stats.Stop();
+  }
+  
+  // Producer thread for generating write operations
+  void WriteProducer(ProducerState* state, OpenLoopSharedState* open_loop_state,
+                    WriteMode write_mode) {
+    SystemClock* clock = FLAGS_env->GetSystemClock().get();
+    OperationQueue* queue = open_loop_state->write_queue.get();
+    ArrivalRateController* rate_ctrl = open_loop_state->rate_controller.get();
+    
+    // Initialize KeyGenerator for UNIQUE_RANDOM mode
+    if (write_mode == Benchmark::UNIQUE_RANDOM) {
+      state->key_gen = new KeyGenerator(&state->rand, write_mode, 
+                                       FLAGS_num, 64 * 1024);
+    }
+    
+    // Signal that producer has started
+    {
+      MutexLock l(&open_loop_state->producer_mu);
+      open_loop_state->producers_started++;
+      if (open_loop_state->producers_started >= open_loop_state->num_producers) {
+        open_loop_state->producer_cv.SignalAll();
+      }
+    }
+    
+    while (!open_loop_state->stop_producers.load()) {
+      // Wait for next arrival
+      uint64_t wait_micros = rate_ctrl->GetNextInterArrivalMicros();
+      if (wait_micros > 0) {
+        FLAGS_env->SleepForMicroseconds(static_cast<int>(wait_micros));
+      }
+      
+      if (open_loop_state->stop_producers.load()) {
+        break;
+      }
+      
+      // Generate operation
+      Operation op;
+      if (write_mode == UNIQUE_RANDOM) {
+        KeyGenerator* kg = static_cast<KeyGenerator*>(state->key_gen);
+        op.key = static_cast<int64_t>(kg->Next());
+      } else if (write_mode == Benchmark::SEQUENTIAL) {
+        op.key = state->operations_generated;
+      } else {
+        op.key = state->rand.Next() % FLAGS_num;
+      }
+      op.type = kWrite;
+      op.schedule_time = clock->NowMicros();
+      op.db_index = static_cast<int>(state->rand.Next() % 
+                                     (multi_dbs_.empty() ? 1 : multi_dbs_.size()));
+      op.cf_index = 0;
+      
+      // Enqueue
+      bool success = queue->Enqueue(op);
+      state->operations_generated++;
+      state->stats.IncrementOpenLoopScheduled();
+      
+      if (!success) {
+        state->stats.IncrementOpenLoopDropped();
+      }
+    }
+    
+    // Clean up KeyGenerator if it was allocated
+    if (state->key_gen != nullptr) {
+      delete static_cast<KeyGenerator*>(state->key_gen);
+      state->key_gen = nullptr;
+    }
+    
+    state->stats.Stop();
+  }
+  
+  // Consumer: Execute a read operation
+  void ExecuteReadOperation(const Operation& op, ThreadState* thread,
+                            RandomGenerator* /*gen*/) {
+    SystemClock* clock = FLAGS_env->GetSystemClock().get();
+    uint64_t start_execution = clock->NowMicros();
+    
+    // Format key
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    GenerateKeyFromInt(op.key, FLAGS_num, &key);
+    
+    // Select DB
+    DBWithColumnFamilies* db_with_cfh;
+    if (multi_dbs_.empty()) {
+      db_with_cfh = &db_;
+    } else {
+      db_with_cfh = &multi_dbs_[op.db_index % multi_dbs_.size()];
+    }
+    
+    // Execute read
+    ReadOptions options = read_options_;
+    PinnableSlice value;
+    Status s;
+    
+    // Handle user timestamp if needed
+    std::unique_ptr<char[]> ts_guard;
+    Slice ts;
+    std::string ts_ret;
+    std::string* ts_ptr = nullptr;
+    if (user_timestamp_size_ > 0) {
+      ts_guard.reset(new char[user_timestamp_size_]);
+      ts = mock_app_clock_->GetTimestampForRead(thread->rand, ts_guard.get());
+      options.timestamp = &ts;
+      ts_ptr = &ts_ret;
+    }
+    
+    ColumnFamilyHandle* cfh = db_with_cfh->db->DefaultColumnFamily();
+    s = db_with_cfh->db->Get(options, cfh, key, &value, ts_ptr);
+    
+    uint64_t finish_time = clock->NowMicros();
+    
+    // Record latencies
+    thread->stats.RecordOpenLoopLatencies(op.schedule_time, start_execution, finish_time);
+    thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kRead);
+    
+    if (!s.ok() && !s.IsNotFound()) {
+      fprintf(stderr, "Get returned an error: %s\n", s.ToString().c_str());
+    }
+  }
+  
+  // Consumer: Execute a write operation
+  void ExecuteWriteOperation(const Operation& op, ThreadState* thread,
+                             RandomGenerator* gen) {
+    SystemClock* clock = FLAGS_env->GetSystemClock().get();
+    uint64_t start_execution = clock->NowMicros();
+    
+    // Format key
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    GenerateKeyFromInt(op.key, FLAGS_num, &key);
+    
+    // Generate value
+    Slice value = gen->Generate();
+    
+    // Select DB
+    DBWithColumnFamilies* db_with_cfh;
+    if (multi_dbs_.empty()) {
+      db_with_cfh = &db_;
+    } else {
+      db_with_cfh = &multi_dbs_[op.db_index % multi_dbs_.size()];
+    }
+    
+    // Execute write
+    WriteOptions options = write_options_;
+    Status s;
+    
+    // Handle user timestamp if needed
+    std::unique_ptr<char[]> ts_guard;
+    Slice ts;
+    if (user_timestamp_size_ > 0) {
+      ts_guard.reset(new char[user_timestamp_size_]);
+      ts = mock_app_clock_->Allocate(ts_guard.get());
+      s = db_with_cfh->db->Put(options, key, ts, value);
+    } else {
+      s = db_with_cfh->db->Put(options, key, value);
+    }
+    
+    uint64_t finish_time = clock->NowMicros();
+    
+    // Record latencies
+    thread->stats.RecordOpenLoopLatencies(op.schedule_time, start_execution, finish_time);
+    thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kWrite);
+    thread->stats.AddBytes(static_cast<int64_t>(key.size() + value.size() + user_timestamp_size_));
+    
+    if (!s.ok()) {
+      fprintf(stderr, "Put returned an error: %s\n", s.ToString().c_str());
+    }
+  }
+  
+  // ============================================================================
+  // End of Open-Loop Producer and Consumer Methods
+  // ============================================================================
 
   void ReadRandom(ThreadState* thread) {
     int64_t read = 0;

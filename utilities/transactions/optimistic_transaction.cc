@@ -8,7 +8,6 @@
 #include "utilities/transactions/optimistic_transaction.h"
 
 #include <string>
-
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "rocksdb/comparator.h"
@@ -18,6 +17,7 @@
 #include "util/cast_util.h"
 #include "util/string_util.h"
 #include "utilities/transactions/lock/point/point_lock_tracker.h"
+#include "test_util/sync_point.h"
 #include "utilities/transactions/optimistic_transaction.h"
 #include "utilities/transactions/optimistic_transaction_db_impl.h"
 #include "utilities/transactions/transaction_util.h"
@@ -126,6 +126,12 @@ Status OptimisticTransaction::CommitWithParallelValidate() {
     return s;
   }
 
+  TEST_SYNC_POINT(
+      "OptimisticTransaction::CommitWithParallelValidate:AfterCheck");
+
+  TEST_SYNC_POINT(
+      "OptimisticTransaction::CommitWithParallelValidate:BeforeWrite");
+
   s = db_impl->Write(write_options_, GetWriteBatch()->GetWriteBatch());
   if (s.ok()) {
     Clear();
@@ -179,12 +185,24 @@ Status OptimisticTransaction::TryLock(ColumnFamilyHandle* column_family,
 Status OptimisticTransaction::CheckTransactionForConflicts(DB* db) {
   auto db_impl = static_cast_with_check<DBImpl>(db);
 
+#ifndef NDEBUG
+  static std::atomic<int> sync_counter{0};
+  int idx = sync_counter.fetch_add(1);
+  TEST_IDX_SYNC_POINT(
+      "OptimisticTransaction::CheckTransactionForConflicts:BeforeCheck:", idx);
+#endif  // NDEBUG
+
   // Since we are on the write thread and do not want to block other writers,
   // we will do a cache-only conflict check.  This can result in TryAgain
   // getting returned if there is not sufficient memtable history to check
   // for conflicts.
-  return TransactionUtil::CheckKeysForConflicts(db_impl, *tracked_locks_,
+  Status s = TransactionUtil::CheckKeysForConflicts(db_impl, *tracked_locks_,
                                                 true /* cache_only */);
+#ifndef NDEBUG
+  TEST_IDX_SYNC_POINT(
+      "OptimisticTransaction::CheckTransactionForConflicts:AfterCheck:", idx);
+#endif  // NDEBUG
+  return s;
 }
 
 Status OptimisticTransaction::SetName(const TransactionName& /* unused */) {

@@ -58,8 +58,7 @@ int main() {
   assert(s.IsNotFound());
 
   // Write a key OUTSIDE of this transaction.
-  // Does not affect txn since this is an unrelated key.  If we wrote key 'abc'
-  // here, the transaction would fail to commit.
+  // Does not affect txn since this is an unrelated key.
   s = db->Put(write_options, "xyz", "zzz");
   assert(s.ok());
   s = db->Put(write_options, "abc", "def");

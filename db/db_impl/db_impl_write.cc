@@ -117,22 +117,28 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     return WriteImplWALOnly(&nonmem_write_thread_, write_options, my_batch,
                             callback, log_used, log_ref, seq_used, batch_cnt,
                             pre_release_callback, assign_order,
-                            kDontPublishLastSeq, disable_memtable);
+                            kDontPublishLastSeq, disable_memtable, nullptr);
   }
 
   if (immutable_db_options_.unordered_write) {
+#ifndef NDEBUG
+    static std::atomic<int> sync_counter{0};
+    int sync_index = sync_counter.fetch_add(1);
+    TEST_IDX_SYNC_POINT("DBImpl::WriteImpl:UnorderedWriteBeforeWriteWAL:", sync_index);
+#endif  // NDEBUG
+
     const size_t sub_batch_cnt = batch_cnt != 0
                                      ? batch_cnt
                                      // every key is a sub-batch consuming a seq
                                      : WriteBatchInternal::Count(my_batch);
     uint64_t seq = 0;
+    Status callback_status;
     // Use a write thread to i) optimize for WAL write, ii) publish last
     // sequence in in increasing order, iii) call pre_release_callback serially
     Status status = WriteImplWALOnly(
         &write_thread_, write_options, my_batch, callback, log_used, log_ref,
         &seq, sub_batch_cnt, pre_release_callback, kDoAssignOrder,
-        kDoPublishLastSeq, disable_memtable);
-    TEST_SYNC_POINT("DBImpl::WriteImpl:UnorderedWriteAfterWriteWAL");
+        kDoPublishLastSeq, disable_memtable, &callback_status);
     if (!status.ok()) {
       return status;
     }
@@ -142,7 +148,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     if (!disable_memtable) {
       TEST_SYNC_POINT("DBImpl::WriteImpl:BeforeUnorderedWriteMemtable");
       status = UnorderedWriteMemtable(write_options, my_batch, callback,
-                                      log_ref, seq, sub_batch_cnt);
+                                      log_ref, seq, sub_batch_cnt, callback_status);
     }
     return status;
   }
@@ -621,15 +627,19 @@ Status DBImpl::UnorderedWriteMemtable(const WriteOptions& write_options,
                                       WriteBatch* my_batch,
                                       WriteCallback* callback, uint64_t log_ref,
                                       SequenceNumber seq,
-                                      const size_t sub_batch_cnt) {
+                                      const size_t sub_batch_cnt,
+                                      const Status& callback_status) {
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   StopWatch write_sw(immutable_db_options_.clock,
                      immutable_db_options_.statistics.get(), DB_WRITE);
 
+  // Initialize writer with callback status from WriteImplWALOnly to avoid
+  // calling the callback twice while still honoring its result.
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
-                        false /*disable_memtable*/);
+                        false /*disable_memtable*/, 0 /*batch_cnt*/,
+                        nullptr /*pre_release_callback*/, callback_status);
 
-  if (w.CheckCallback(this) && w.ShouldWriteToMemtable()) {
+  if (w.ShouldWriteToMemtable()) {
     w.sequence = seq;
     size_t total_count = WriteBatchInternal::Count(my_batch);
     InternalStats* stats = default_cf_internal_stats_;
@@ -674,7 +684,8 @@ Status DBImpl::WriteImplWALOnly(
     WriteBatch* my_batch, WriteCallback* callback, uint64_t* log_used,
     const uint64_t log_ref, uint64_t* seq_used, const size_t sub_batch_cnt,
     PreReleaseCallback* pre_release_callback, const AssignOrder assign_order,
-    const PublishLastSeq publish_last_seq, const bool disable_memtable) {
+    const PublishLastSeq publish_last_seq, const bool disable_memtable,
+    Status* callback_status_out) {
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
                         disable_memtable, sub_batch_cnt, pre_release_callback);
@@ -850,6 +861,9 @@ Status DBImpl::WriteImplWALOnly(
   }
   if (seq_used != nullptr) {
     *seq_used = w.sequence;
+  }
+  if (callback_status_out != nullptr) {
+    *callback_status_out = w.callback_status;
   }
   return status;
 }

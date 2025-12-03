@@ -1193,7 +1193,8 @@ class DBImpl : public DB {
   Status UnorderedWriteMemtable(const WriteOptions& write_options,
                                 WriteBatch* my_batch, WriteCallback* callback,
                                 uint64_t log_ref, SequenceNumber seq,
-                                const size_t sub_batch_cnt);
+                                const size_t sub_batch_cnt,
+                                const Status& callback_status);
 
   // Whether the batch requires to be assigned with an order
   enum AssignOrder : bool { kDontAssignOrder, kDoAssignOrder };
@@ -1214,7 +1215,8 @@ class DBImpl : public DB {
       WriteBatch* updates, WriteCallback* callback, uint64_t* log_used,
       const uint64_t log_ref, uint64_t* seq_used, const size_t sub_batch_cnt,
       PreReleaseCallback* pre_release_callback, const AssignOrder assign_order,
-      const PublishLastSeq publish_last_seq, const bool disable_memtable);
+      const PublishLastSeq publish_last_seq, const bool disable_memtable,
+      Status* callback_status_out = nullptr);
 
   // write cached_recoverable_state_ to memtable if it is not empty
   // The writer must be the leader in write_thread_ and holding mutex_

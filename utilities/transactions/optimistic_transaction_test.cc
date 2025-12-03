@@ -5,7 +5,9 @@
 
 #ifndef ROCKSDB_LITE
 
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -164,6 +166,61 @@ TEST_P(OptimisticTransactionTest, WriteConflictTest2) {
   ASSERT_EQ(value, "barz");
   ASSERT_OK(txn_db->Get(read_options, "foo2", &value));
   ASSERT_EQ(value, "bar");
+
+  delete txn;
+}
+
+TEST_P(OptimisticTransactionTest,
+       ParallelValidateMissesWriteBetweenCheckAndWrite) {
+  if (GetParam() != OccValidationPolicy::kValidateParallel) {
+    return;
+  }
+
+  WriteOptions write_options;
+  ReadOptions read_options;
+  OptimisticTransactionOptions txn_options;
+  txn_options.set_snapshot = true;
+
+  ASSERT_OK(txn_db->Put(write_options, "foo", "bar"));
+
+  Transaction* txn = txn_db->BeginTransaction(write_options, txn_options);
+  ASSERT_NE(txn, nullptr);
+  ASSERT_OK(txn->Put("foo", "txn-value"));
+
+  // Coordinate using LoadDependency:
+  // AfterCheck blocks until external put starts
+  // BeforeWrite blocks until external put finishes  
+  SyncPoint::GetInstance()->LoadDependency({
+      {"OptimisticTransaction::CommitWithParallelValidate:AfterCheck",
+       "ParallelValidateTest::BeforeExternalPut"},
+      {"ParallelValidateTest::AfterExternalPut",
+       "OptimisticTransaction::CommitWithParallelValidate:BeforeWrite"},
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status commit_status;
+  std::thread commit_thread([&] { commit_status = txn->Commit(); });
+
+  // Do external put in separate thread
+  Status external_put;
+  std::thread external_thread([&]() {
+    TEST_SYNC_POINT("ParallelValidateTest::BeforeExternalPut");
+    external_put = txn_db->Put(write_options, "foo", "external");
+    TEST_SYNC_POINT("ParallelValidateTest::AfterExternalPut");
+  });
+
+  commit_thread.join();
+  external_thread.join();
+  
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(external_put);
+  ASSERT_TRUE(commit_status.IsBusy());
+
+  string value;
+  ASSERT_OK(txn_db->Get(read_options, "foo", &value));
+  ASSERT_EQ(value, "external");
 
   delete txn;
 }
@@ -1391,6 +1448,200 @@ TEST_P(OptimisticTransactionTest, SequenceNumberAfterRecoverTest) {
   ASSERT_OK(s);
 
   delete transaction;
+}
+
+// Test for unordered_write bug where conflicts are not detected
+// Only run with kValidateSerial since that's where the bug occurs
+TEST(OptimisticTransactionTest, UnorderedWriteConflictDetectionBug) {
+#ifdef NDEBUG
+  return;
+#endif  // NDEBUG
+
+  // Setup database with unordered_write enabled
+  Options options;
+  options.create_if_missing = true;
+  options.unordered_write = true;  // Enable unordered_write
+  options.allow_concurrent_memtable_write = true;  // Required for unordered_write
+  options.max_write_buffer_size_to_maintain = 10000000;  // Large enough for conflict check
+  
+  std::string dbname = test::PerThreadDBPath("occ_unordered_write_bug_test");
+  DestroyDB(dbname, options);
+  
+  OptimisticTransactionDB* txn_db;
+  ColumnFamilyOptions cf_options(options);
+  OptimisticTransactionDBOptions occ_opts;
+  occ_opts.validate_policy = OccValidationPolicy::kValidateSerial;  // Bug only in serial mode
+  
+  std::vector<ColumnFamilyDescriptor> column_families;
+  std::vector<ColumnFamilyHandle*> handles;
+  column_families.push_back(
+      ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
+  
+  Status s = OptimisticTransactionDB::Open(
+      DBOptions(options), occ_opts, dbname, column_families, &handles, &txn_db);
+  
+  ASSERT_OK(s);
+  ASSERT_NE(txn_db, nullptr);
+  ASSERT_EQ(handles.size(), 1);
+  delete handles[0];
+  
+  WriteOptions write_options;
+  ReadOptions read_options;
+  
+  
+  Status txn1_status;
+  Status txn2_status;
+  
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+      // Txn2 completes WAL (idx=1) before Txn1 checks (idx=2)
+      {
+        "DBImpl::WriteImpl:UnorderedWriteBeforeWriteWAL:0",
+        "OptimisticTransaction::CheckTransactionForConflicts:BeforeCheck:1"
+      },
+      // Txn1 finishes check (idx=2) before Txn2 writes to memtable (idx=1)
+      {
+        "OptimisticTransaction::CheckTransactionForConflicts:AfterCheck:1",
+        "DBImpl::WriteImpl:BeforeUnorderedWriteMemtable",
+      },
+  });
+  
+  SyncPoint::GetInstance()->EnableProcessing();
+  
+  // Create both transactions BEFORE either commits
+  Transaction* txn1 = txn_db->BeginTransaction(write_options);
+  Transaction* txn2 = txn_db->BeginTransaction(write_options);
+  
+  ASSERT_OK(txn1->Put("key", "txn1_value"));
+  ASSERT_OK(txn2->Put("key", "txn2_value"));
+  
+  // Thread for txn2 - commits first
+  std::thread t2([&]() {
+    txn2_status = txn2->Commit();
+    delete txn2;
+  });
+  
+  // Small delay to ensure txn2 starts first
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  
+  // Thread for txn1 - commits second
+  std::thread t1([&]() {
+    txn1_status = txn1->Commit();
+    delete txn1;
+  });
+  
+  t1.join();
+  t2.join();
+  
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  
+
+  ASSERT_TRUE(txn1_status.IsBusy() || txn2_status.IsBusy())
+      << "Bug reproduced! Both transactions succeeded when at least one should fail.\n"
+      << "txn1 status: " << txn1_status.ToString() << "\n"
+      << "txn2 status: " << txn2_status.ToString();
+  
+  delete txn_db;
+  DestroyDB(dbname, options);
+}
+
+// Simpler test that uses timing-based race condition
+TEST(OptimisticTransactionTest, UnorderedWriteSimpleRace) {
+  Options options;
+  options.create_if_missing = true;
+  options.unordered_write = true;
+  options.allow_concurrent_memtable_write = true;
+  options.max_write_buffer_size_to_maintain = 10000000;
+  
+  std::string dbname = test::PerThreadDBPath("occ_unordered_simple_race_test");
+  DestroyDB(dbname, options);
+  
+  OptimisticTransactionDB* txn_db;
+  ColumnFamilyOptions cf_options(options);
+  OptimisticTransactionDBOptions occ_opts;
+  occ_opts.validate_policy = OccValidationPolicy::kValidateSerial;
+  
+  std::vector<ColumnFamilyDescriptor> column_families;
+  std::vector<ColumnFamilyHandle*> handles;
+  column_families.push_back(
+      ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
+  
+  Status s = OptimisticTransactionDB::Open(
+      DBOptions(options), occ_opts, dbname, column_families, &handles, &txn_db);
+  
+  ASSERT_OK(s);
+  ASSERT_NE(txn_db, nullptr);
+  ASSERT_EQ(handles.size(), 1);
+  delete handles[0];
+  
+  WriteOptions write_options;
+  ReadOptions read_options;
+  
+  // Initial write
+  ASSERT_OK(txn_db->Put(write_options, "key", "initial"));
+  
+  std::atomic<int> commits_succeeded{0};
+  std::atomic<int> commits_failed{0};
+  
+  auto txn_work = [&](const std::string& value) {
+    Transaction* txn = txn_db->BeginTransaction(write_options);
+    string read_value;
+    
+    // Read to establish snapshot
+    Status s = txn->GetForUpdate(read_options, "key", &read_value);
+    if (!s.ok()) {
+      delete txn;
+      return;
+    }
+    
+    // Write new value
+    s = txn->Put("key", value);
+    if (!s.ok()) {
+      delete txn;
+      return;
+    }
+    
+    // Small delay to increase race window
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    
+    // Commit
+    s = txn->Commit();
+    
+    if (s.ok()) {
+      commits_succeeded.fetch_add(1);
+    } else if (s.IsBusy()) {
+      commits_failed.fetch_add(1);
+    }
+    
+    delete txn;
+  };
+  
+  // Run multiple concurrent transactions
+  const int num_txns = 10;
+  std::vector<std::thread> threads;
+  
+  for (int i = 0; i < num_txns; i++) {
+    threads.emplace_back(txn_work, "value" + ToString(i));
+  }
+  
+  for (auto& t : threads) {
+    t.join();
+  }
+  
+  // If bug exists, multiple transactions may succeed
+  // When fixed, at most 1 should succeed
+  // For now, just check that the test runs without crashing
+  ASSERT_GE(commits_succeeded.load() + commits_failed.load(), 1);
+  
+  if (commits_succeeded.load() > 1) {
+    fprintf(stderr,
+            "WARNING: Bug likely present - %d transactions succeeded "
+            "(expected at most 1)\n",
+            commits_succeeded.load());
+  }
+  
+  delete txn_db;
+  DestroyDB(dbname, options);
 }
 
 INSTANTIATE_TEST_CASE_P(

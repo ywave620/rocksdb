@@ -158,7 +158,8 @@ class WriteThread {
     Writer(const WriteOptions& write_options, WriteBatch* _batch,
            WriteCallback* _callback, uint64_t _log_ref, bool _disable_memtable,
            size_t _batch_cnt = 0,
-           PreReleaseCallback* _pre_release_callback = nullptr)
+           PreReleaseCallback* _pre_release_callback = nullptr,
+           const Status& initial_callback_status = Status::OK())
         : batch(_batch),
           sync(write_options.sync),
           no_slowdown(write_options.no_slowdown),
@@ -174,6 +175,7 @@ class WriteThread {
           state(STATE_INIT),
           write_group(nullptr),
           sequence(kMaxSequenceNumber),
+          callback_status(initial_callback_status),
           link_older(nullptr),
           link_newer(nullptr) {}
 

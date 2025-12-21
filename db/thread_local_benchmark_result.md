@@ -5,6 +5,22 @@ g++ -std=c++17 -O3 -I. -Iinclude -pthread \
       util/thread_local.o port/port_posix.o util/string_util.o \
       -o thread_local_resource_bench
 
+for linux
+```sh
+g++ -std=c++17 -O3 -I. -Iinclude -pthread \
+    -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DOS_LINUX \
+    -c util/thread_local.cc -o util/thread_local.o && g++ -std=c++17 -O3 -I. -Iinclude -pthread \
+    -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DOS_LINUX \
+    -c port/port_posix.cc -o port/port_posix.o && g++ -std=c++17 -O3 -I. -Iinclude -pthread \
+    -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DOS_LINUX \
+    -c util/string_util.cc -o util/string_util.o && g++ -std=c++17 -O3 -I. -Iinclude -pthread \
+    -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DOS_LINUX \
+    db/thread_local_resource_bench.cc \
+    util/thread_local.o port/port_posix.o util/string_util.o \
+    -o thread_local_resource_bench
+```
+
+
 ● The benchmark results are very illuminating. Let me summarize the findings:
 
   Benchmark Results Summary

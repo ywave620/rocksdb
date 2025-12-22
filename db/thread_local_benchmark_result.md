@@ -1,4 +1,17 @@
 
+## conclusion
+
+A thread safe counter is really expensive under high contention. Since there is not built in atomic operation for it, it need to use lock. (OCC style  inc/dec does now work high contention)
+
+Frequent atomic operations across threads like spinlock is really bad for mult threads performance.
+
+
+This is why thread local ptr beats others
+This is why RWMutex beats Mutex
+
+
+## how to run
+
 g++ -std=c++17 -O3 -I. -Iinclude -pthread \
       -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DOS_MACOSX \
       db/thread_local_resource_bench.cc \

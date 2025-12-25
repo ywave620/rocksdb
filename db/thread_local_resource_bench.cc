@@ -51,12 +51,14 @@ namespace ROCKSDB_NAMESPACE {
 struct CounterResource {
   std::atomic<uint64_t> value;
   std::atomic<uint32_t> refs;
+  uint64_t version;  // Immutable after construction
 
   static int dummy;
   static void* const kInUse;
   static void* const kObsolete;
 
-  explicit CounterResource(uint64_t v) : value(v), refs(1) {}
+  explicit CounterResource(uint64_t v, uint64_t ver = 0)
+      : value(v), refs(1), version(ver) {}
 
   CounterResource* Ref() {
     refs.fetch_add(1, std::memory_order_relaxed);
@@ -93,6 +95,20 @@ void ResourceUnrefHandle(void* ptr) {
   }
 }
 
+// Cleanup callback for ThreadLocalPtr (versioned)
+// Note: Unlike the original pattern where scraping happens before resource
+// deletion, the versioned pattern may have thread-local slots holding the
+// last reference (since we don't scrape). So we must handle deletion here.
+void VersionedResourceUnrefHandle(void* ptr) {
+  CounterResource* res = static_cast<CounterResource*>(ptr);
+  if (res != nullptr && res != CounterResource::kInUse &&
+      res != CounterResource::kObsolete) {
+    if (res->Unref()) {
+      delete res;
+    }
+  }
+}
+
 // =============================================================================
 // ResourceManager - Thread-local caching pattern (RocksDB style)
 // =============================================================================
@@ -104,10 +120,16 @@ void ResourceUnrefHandle(void* ptr) {
 //   3. Atomic CAS to return it
 // No shared state is touched!
 //
+// Template parameter UnnecessaryVersionCheck: when true, adds an unnecessary
+// version comparison in GetThreadLocalResource to measure the overhead of
+// the version check alone (for benchmarking purposes).
+//
+template <bool UnnecessaryVersionCheck = false>
 class ResourceManager {
  public:
   ResourceManager()
       : current_resource_(new CounterResource(0)),
+        current_version_(0),
         local_resource_(new ThreadLocalPtr(&ResourceUnrefHandle)) {}
 
   ~ResourceManager() {
@@ -127,7 +149,18 @@ class ResourceManager {
     if (res == CounterResource::kObsolete) {
       std::lock_guard<std::mutex> lock(mutex_);
       res = current_resource_->Ref();
+    } else if constexpr (UnnecessaryVersionCheck) {
+      // Unnecessary version check - the resource is already valid since
+      // we use scraping. This is just to measure the overhead of version
+      // comparison in the read path.
+      uint64_t current_ver = current_version_.load(std::memory_order_acquire);
+      if (res->version != current_ver) {
+        // This branch should rarely/never be taken in practice since
+        // scraping already invalidates stale resources.
+        // The point is just to add the atomic load + compare overhead.
+      }
     }
+
     assert(res != nullptr);
     return res;
   }
@@ -143,12 +176,14 @@ class ResourceManager {
   }
 
   void InstallNewResource(uint64_t new_value) {
-    CounterResource* new_res = new CounterResource(new_value);
     CounterResource* old_res;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      uint64_t new_version = current_version_.load(std::memory_order_relaxed) + 1;
+      CounterResource* new_res = new CounterResource(new_value, new_version);
       old_res = current_resource_;
       current_resource_ = new_res;
+      current_version_.store(new_version, std::memory_order_release);
       ResetThreadLocalResources();
     }
     if (old_res != nullptr && old_res->Unref()) {
@@ -173,6 +208,99 @@ class ResourceManager {
   }
 
   CounterResource* current_resource_;
+  std::atomic<uint64_t> current_version_;
+  std::unique_ptr<ThreadLocalPtr> local_resource_;
+  std::mutex mutex_;
+};
+
+// =============================================================================
+// VersionedResourceManager - Version-based staleness check
+// =============================================================================
+// This pattern adds a version field to the resource. Instead of marking
+// thread-local slots as obsolete, we compare versions. If the cached
+// resource's version doesn't match current, we unref it and get a new one.
+//
+// Advantages:
+// - No need to scrape all thread-local slots on write (O(1) vs O(threads))
+// - Readers detect staleness themselves via version comparison
+//
+// Trade-offs:
+// - Readers may hold stale references slightly longer
+// - Each read does a version comparison (but avoids mutex in common case)
+//
+class VersionedResourceManager {
+ public:
+  VersionedResourceManager()
+      : current_resource_(new CounterResource(0, 0)),
+        current_version_(0),
+        local_resource_(new ThreadLocalPtr(&VersionedResourceUnrefHandle)) {}
+
+  ~VersionedResourceManager() {
+    local_resource_.reset();
+    if (current_resource_ != nullptr) {
+      if (current_resource_->Unref()) {
+        delete current_resource_;
+      }
+    }
+  }
+
+  CounterResource* GetThreadLocalResource() {
+    void* ptr = local_resource_->Swap(CounterResource::kInUse);
+    assert(ptr != CounterResource::kInUse);
+    CounterResource* res = static_cast<CounterResource*>(ptr);
+
+    if (res == CounterResource::kObsolete) {
+      // First access or explicitly invalidated - acquire from current
+      std::lock_guard<std::mutex> lock(mutex_);
+      res = current_resource_->Ref();
+    } else if (res != nullptr) {
+      // Have a cached resource - check if version matches current
+      uint64_t current_ver = current_version_.load(std::memory_order_acquire);
+      if (res->version != current_ver) {
+        // Version mismatch - resource is stale, unref and get current
+        if (res->Unref()) {
+          delete res;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        res = current_resource_->Ref();
+      }
+      // else: version matches, use cached resource (fast path!)
+    }
+    assert(res != nullptr);
+    return res;
+  }
+
+  bool ReturnThreadLocalResource(CounterResource* res) {
+    assert(res != nullptr);
+    void* expected = CounterResource::kInUse;
+    if (local_resource_->CompareAndSwap(static_cast<void*>(res), expected)) {
+      return true;
+    }
+    assert(expected == CounterResource::kObsolete);
+    return false;
+  }
+
+  void InstallNewResource(uint64_t new_value) {
+    CounterResource* old_res;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      uint64_t new_version = current_version_.load(std::memory_order_relaxed) + 1;
+      CounterResource* new_res = new CounterResource(new_value, new_version);
+      old_res = current_resource_;
+      current_resource_ = new_res;
+      // Update version AFTER installing new resource
+      current_version_.store(new_version, std::memory_order_release);
+      // Note: We do NOT scrape thread-local slots here!
+      // Readers will detect staleness via version comparison.
+    }
+    if (old_res != nullptr && old_res->Unref()) {
+      delete old_res;
+    }
+  }
+
+ private:
+  CounterResource* current_resource_;
+  std::atomic<uint64_t> current_version_;
   std::unique_ptr<ThreadLocalPtr> local_resource_;
   std::mutex mutex_;
 };
@@ -321,9 +449,10 @@ class Benchmark {
     double writes_per_second = 0;
   };
 
-  // Benchmark: Thread-Local Pattern
-  static Results RunThreadLocalBenchmark(const Config& config) {
-    ResourceManager manager;
+  // Generic benchmark for ResourceManager-like types
+  template <typename ManagerType>
+  static Results RunResourceManagerBenchmark(const Config& config) {
+    ManagerType manager;
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> total_reads{0};
     std::atomic<uint64_t> total_writes{0};
@@ -374,6 +503,17 @@ class Benchmark {
     results.writes_per_second =
         static_cast<double>(results.total_writes) / config.duration_seconds;
     return results;
+  }
+
+  // Benchmark: Thread-Local Pattern
+  template <bool UnnecessaryVersionCheck = false>
+  static Results RunThreadLocalBenchmark(const Config& config) {
+    return RunResourceManagerBenchmark<ResourceManager<UnnecessaryVersionCheck>>(config);
+  }
+
+  // Benchmark: Versioned Thread-Local Pattern
+  static Results RunVersionedThreadLocalBenchmark(const Config& config) {
+    return RunResourceManagerBenchmark<VersionedResourceManager>(config);
   }
 
   // Benchmark: atomic shared_ptr
@@ -603,24 +743,28 @@ int main(int argc, char** argv) {
   printf("  Scenario: Read-heavy workload with infrequent updates\n\n");
 
   // Header
-  printf("%-6s | %-14s | %-14s | %-14s | %-14s | %-14s\n",
-         "Rdrs", "ThreadLocal", "atomic<sp>", "RCU-style", "RWLock", "Mutex");
-  printf("-------|----------------|----------------|----------------|----------------|----------------\n");
+  printf("%-6s | %-14s | %-14s | %-14s | %-14s | %-14s | %-14s | %-14s\n",
+         "Rdrs", "ThreadLocal", "TL+VerChk", "Versioned-TL", "atomic<sp>", "RCU-style", "RWLock", "Mutex");
+  printf("-------|----------------|----------------|----------------|----------------|----------------|----------------|----------------\n");
 
   std::vector<int> reader_counts = {1, 2, 4, 8, 16};
 
   for (int num_readers : reader_counts) {
     config.num_readers = num_readers;
 
-    auto tl = Benchmark::RunThreadLocalBenchmark(config);
+    auto tl = Benchmark::RunThreadLocalBenchmark<false>(config);
+    auto tlvc = Benchmark::RunThreadLocalBenchmark<true>(config);
+    auto vtl = Benchmark::RunVersionedThreadLocalBenchmark(config);
     auto asp = Benchmark::RunAtomicSharedPtrBenchmark(config);
     auto rcu = Benchmark::RunRCUStyleBenchmark(config);
     auto rwl = Benchmark::RunRWLockBenchmark(config);
     auto mtx = Benchmark::RunMutexBenchmark(config);
 
-    printf("%-6d | %11.2f M | %11.2f M | %11.2f M | %11.2f M | %11.2f M\n",
+    printf("%-6d | %11.2f M | %11.2f M | %11.2f M | %11.2f M | %11.2f M | %11.2f M | %11.2f M\n",
            num_readers,
            tl.reads_per_second / 1e6,
+           tlvc.reads_per_second / 1e6,
+           vtl.reads_per_second / 1e6,
            asp.reads_per_second / 1e6,
            rcu.reads_per_second / 1e6,
            rwl.reads_per_second / 1e6,
@@ -631,20 +775,30 @@ int main(int argc, char** argv) {
   printf("\n=== Speedup vs Mutex (8 readers) ===\n");
   config.num_readers = 8;
 
-  auto tl = Benchmark::RunThreadLocalBenchmark(config);
+  auto tl = Benchmark::RunThreadLocalBenchmark<false>(config);
+  auto tlvc = Benchmark::RunThreadLocalBenchmark<true>(config);
+  auto vtl = Benchmark::RunVersionedThreadLocalBenchmark(config);
   auto asp = Benchmark::RunAtomicSharedPtrBenchmark(config);
   auto rcu = Benchmark::RunRCUStyleBenchmark(config);
   auto rwl = Benchmark::RunRWLockBenchmark(config);
   auto mtx = Benchmark::RunMutexBenchmark(config);
 
   printf("ThreadLocal:     %.2fx\n", tl.reads_per_second / mtx.reads_per_second);
+  printf("TL+VerChk:       %.2fx\n", tlvc.reads_per_second / mtx.reads_per_second);
+  printf("Versioned-TL:    %.2fx\n", vtl.reads_per_second / mtx.reads_per_second);
   printf("atomic<sp>:      %.2fx\n", asp.reads_per_second / mtx.reads_per_second);
   printf("RCU-style:       %.2fx\n", rcu.reads_per_second / mtx.reads_per_second);
   printf("RWLock:          %.2fx\n", rwl.reads_per_second / mtx.reads_per_second);
 
   printf("\n=== Speedup vs atomic<shared_ptr> (8 readers) ===\n");
   printf("ThreadLocal:     %.2fx\n", tl.reads_per_second / asp.reads_per_second);
+  printf("TL+VerChk:       %.2fx\n", tlvc.reads_per_second / asp.reads_per_second);
+  printf("Versioned-TL:    %.2fx\n", vtl.reads_per_second / asp.reads_per_second);
   printf("RCU-style:       %.2fx\n", rcu.reads_per_second / asp.reads_per_second);
+
+  printf("\n=== Version check overhead (8 readers) ===\n");
+  printf("TL+VerChk vs TL: %.2fx\n", tlvc.reads_per_second / tl.reads_per_second);
+  printf("Versioned-TL vs TL: %.2fx\n", vtl.reads_per_second / tl.reads_per_second);
 
   printf("\n=== Analysis ===\n\n");
 
@@ -654,22 +808,28 @@ int main(int argc, char** argv) {
   printf("   - Fast path: atomic swap (no shared state touched)\n");
   printf("   - Trade-off: Complex implementation, O(threads) write cost\n\n");
 
-  printf("2. atomic<shared_ptr> (std::atomic_load/store):\n");
+  printf("2. Versioned ThreadLocal:\n");
+  printf("   - Best for: High-frequency reads, infrequent writes, many threads\n");
+  printf("   - Mechanism: Per-thread cached reference with version check\n");
+  printf("   - Fast path: atomic swap + version compare (no scrape needed)\n");
+  printf("   - Trade-off: Extra version comparison, but O(1) write cost\n\n");
+
+  printf("3. atomic<shared_ptr> (std::atomic_load/store):\n");
   printf("   - Best for: Simple code, moderate read frequency\n");
   printf("   - Mechanism: Atomic load/store with internal spinlock\n");
   printf("   - Trade-off: Every read touches shared refcount\n\n");
 
-  printf("3. RCU-style (atomic pointer):\n");
+  printf("4. RCU-style (atomic pointer):\n");
   printf("   - Best for: Extreme read performance, can leak/defer cleanup\n");
   printf("   - Mechanism: Single atomic load, deferred reclamation\n");
   printf("   - Trade-off: Memory reclamation complexity, memory usage\n\n");
 
-  printf("4. RWLock (shared_mutex):\n");
+  printf("5. RWLock (shared_mutex):\n");
   printf("   - Best for: Simple code, mixed read/write workloads\n");
   printf("   - Mechanism: Reader-writer lock\n");
   printf("   - Trade-off: Still has contention, writer starvation possible\n\n");
 
-  printf("5. Mutex:\n");
+  printf("6. Mutex:\n");
   printf("   - Best for: Simple code, low contention\n");
   printf("   - Trade-off: Serializes all access\n");
 

@@ -12,13 +12,16 @@ This is why RWMutex beats Mutex
 
 ## how to run
 
-g++ -std=c++17 -O3 -I. -Iinclude -pthread \
-      -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DOS_MACOSX \
-      db/thread_local_resource_bench.cc \
-      util/thread_local.o port/port_posix.o util/string_util.o \
-      -o thread_local_resource_bench
+for macOS:
+```sh
+make util/thread_local.o port/port_posix.o util/string_util.o -j4 && g++ -std=c++17 -O3 -I. -Iinclude -pthread \
+    -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DOS_MACOSX \
+    db/thread_local_resource_bench.cc \
+    util/thread_local.o port/port_posix.o util/string_util.o \
+    -o thread_local_resource_bench
+```
 
-for linux
+for linux:
 ```sh
 g++ -std=c++17 -O3 -I. -Iinclude -pthread \
     -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DOS_LINUX \

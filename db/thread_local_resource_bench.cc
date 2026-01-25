@@ -34,10 +34,13 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "util/autovector.h"
@@ -75,6 +78,115 @@ struct CounterResource {
 int CounterResource::dummy = 0;
 void* const CounterResource::kInUse = &CounterResource::dummy;
 void* const CounterResource::kObsolete = nullptr;
+
+// =============================================================================
+// WorkSimulator - Simulates realistic work after acquiring a resource
+// =============================================================================
+// This class simulates what a real reader might do after getting a resource:
+// - Access a thread-local hash table (like a block cache lookup)
+// - Do some memory allocation (like creating iterators or buffers)
+// - Perform some computation
+//
+// This makes the benchmark more realistic by amortizing the resource
+// acquisition cost over actual work.
+//
+class WorkSimulator {
+ public:
+  // Amount of work to simulate per read operation
+  enum class WorkLevel {
+    kNone,      // No work - pure resource acquisition benchmark
+    kMinimal,   // ~10 hash lookups
+    kLight,     // ~50 hash lookups + small allocation
+    kMedium,    // ~100 hash lookups + medium allocation + computation
+    kHeavy,     // ~500 hash lookups + large allocation + heavy computation
+  };
+
+  WorkSimulator() : rng_(std::random_device{}()) {
+    // Pre-populate the hash table with some data
+    for (int i = 0; i < 10000; i++) {
+      local_cache_[i] = i * 17 + 31;
+    }
+  }
+
+  // Simulate work that a reader might do after acquiring a resource
+  // Returns a value to prevent compiler from optimizing away the work
+  uint64_t DoWork(WorkLevel level, uint64_t resource_value) {
+    switch (level) {
+      case WorkLevel::kNone:
+        return resource_value;
+
+      case WorkLevel::kMinimal:
+        return DoHashLookups(10, resource_value);
+
+      case WorkLevel::kLight:
+        return DoHashLookups(50, resource_value) + DoSmallAllocation();
+
+      case WorkLevel::kMedium:
+        return DoHashLookups(100, resource_value) + 
+               DoMediumAllocation() + 
+               DoComputation(100);
+
+      case WorkLevel::kHeavy:
+        return DoHashLookups(500, resource_value) + 
+               DoLargeAllocation() + 
+               DoComputation(1000);
+    }
+    return resource_value;
+  }
+
+ private:
+  // Simulate hash table lookups (like block cache lookups)
+  uint64_t DoHashLookups(int count, uint64_t seed) {
+    uint64_t result = 0;
+    for (int i = 0; i < count; i++) {
+      int key = (seed + i * 7) % 10000;
+      auto it = local_cache_.find(key);
+      if (it != local_cache_.end()) {
+        result += it->second;
+      }
+    }
+    return result;
+  }
+
+  // Simulate small allocation (like creating a small buffer)
+  uint64_t DoSmallAllocation() {
+    auto ptr = std::make_unique<char[]>(64);
+    ptr[0] = 'x';
+    return static_cast<uint64_t>(ptr[0]);
+  }
+
+  // Simulate medium allocation (like creating an iterator)
+  uint64_t DoMediumAllocation() {
+    auto ptr = std::make_unique<char[]>(4096);
+    ptr[0] = 'x';
+    ptr[4095] = 'y';
+    return static_cast<uint64_t>(ptr[0] + ptr[4095]);
+  }
+
+  // Simulate large allocation (like creating a large buffer)
+  uint64_t DoLargeAllocation() {
+    auto ptr = std::make_unique<char[]>(65536);
+    ptr[0] = 'x';
+    ptr[65535] = 'y';
+    return static_cast<uint64_t>(ptr[0] + ptr[65535]);
+  }
+
+  // Simulate some computation
+  uint64_t DoComputation(int iterations) {
+    uint64_t result = 0;
+    for (int i = 0; i < iterations; i++) {
+      result = result * 31 + i;
+      result ^= (result >> 17);
+    }
+    return result;
+  }
+
+  std::unordered_map<int, uint64_t> local_cache_;
+  std::mt19937_64 rng_;
+};
+
+// Thread-local work simulator (each thread gets its own)
+thread_local WorkSimulator g_work_simulator;
 
 // =============================================================================
 // SharedResource - Resource for shared_ptr approaches
@@ -440,6 +552,7 @@ class Benchmark {
     int num_writers = 1;
     int duration_seconds = 3;
     int write_interval_us = 1000;
+    WorkSimulator::WorkLevel work_level = WorkSimulator::WorkLevel::kNone;
   };
 
   struct Results {
@@ -449,6 +562,17 @@ class Benchmark {
     double writes_per_second = 0;
   };
 
+  static const char* WorkLevelName(WorkSimulator::WorkLevel level) {
+    switch (level) {
+      case WorkSimulator::WorkLevel::kNone: return "None";
+      case WorkSimulator::WorkLevel::kMinimal: return "Minimal";
+      case WorkSimulator::WorkLevel::kLight: return "Light";
+      case WorkSimulator::WorkLevel::kMedium: return "Medium";
+      case WorkSimulator::WorkLevel::kHeavy: return "Heavy";
+    }
+    return "Unknown";
+  }
+
   // Generic benchmark for ResourceManager-like types
   template <typename ManagerType>
   static Results RunResourceManagerBenchmark(const Config& config) {
@@ -456,20 +580,24 @@ class Benchmark {
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> total_reads{0};
     std::atomic<uint64_t> total_writes{0};
+    WorkSimulator::WorkLevel work_level = config.work_level;
 
     std::vector<std::thread> readers;
     for (int i = 0; i < config.num_readers; i++) {
-      readers.emplace_back([&]() {
+      readers.emplace_back([&, work_level]() {
         uint64_t local_reads = 0;
+        volatile uint64_t work_result = 0;
         while (!stop.load(std::memory_order_relaxed)) {
           CounterResource* res = manager.GetThreadLocalResource();
-          volatile uint64_t v = res->value.load(std::memory_order_relaxed);
-          (void)v;
+          uint64_t v = res->value.load(std::memory_order_relaxed);
+          // Simulate work after acquiring resource
+          work_result += g_work_simulator.DoWork(work_level, v);
           if (!manager.ReturnThreadLocalResource(res)) {
             if (res->Unref()) delete res;
           }
           local_reads++;
         }
+        (void)work_result;
         total_reads.fetch_add(local_reads, std::memory_order_relaxed);
       });
     }
@@ -522,17 +650,21 @@ class Benchmark {
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> total_reads{0};
     std::atomic<uint64_t> total_writes{0};
+    WorkSimulator::WorkLevel work_level = config.work_level;
 
     std::vector<std::thread> readers;
     for (int i = 0; i < config.num_readers; i++) {
-      readers.emplace_back([&]() {
+      readers.emplace_back([&, work_level]() {
         uint64_t local_reads = 0;
+        volatile uint64_t work_result = 0;
         while (!stop.load(std::memory_order_relaxed)) {
           auto res = manager.GetResource();
-          volatile uint64_t v = res->value;
-          (void)v;
+          uint64_t v = res->value;
+          // Simulate work after acquiring resource
+          work_result += g_work_simulator.DoWork(work_level, v);
           local_reads++;
         }
+        (void)work_result;
         total_reads.fetch_add(local_reads, std::memory_order_relaxed);
       });
     }
@@ -574,17 +706,21 @@ class Benchmark {
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> total_reads{0};
     std::atomic<uint64_t> total_writes{0};
+    WorkSimulator::WorkLevel work_level = config.work_level;
 
     std::vector<std::thread> readers;
     for (int i = 0; i < config.num_readers; i++) {
-      readers.emplace_back([&]() {
+      readers.emplace_back([&, work_level]() {
         uint64_t local_reads = 0;
+        volatile uint64_t work_result = 0;
         while (!stop.load(std::memory_order_relaxed)) {
           const SharedResource* res = manager.GetResource();
-          volatile uint64_t v = res->value;
-          (void)v;
+          uint64_t v = res->value;
+          // Simulate work after acquiring resource
+          work_result += g_work_simulator.DoWork(work_level, v);
           local_reads++;
         }
+        (void)work_result;
         total_reads.fetch_add(local_reads, std::memory_order_relaxed);
       });
     }
@@ -626,16 +762,20 @@ class Benchmark {
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> total_reads{0};
     std::atomic<uint64_t> total_writes{0};
+    WorkSimulator::WorkLevel work_level = config.work_level;
 
     std::vector<std::thread> readers;
     for (int i = 0; i < config.num_readers; i++) {
-      readers.emplace_back([&]() {
+      readers.emplace_back([&, work_level]() {
         uint64_t local_reads = 0;
+        volatile uint64_t work_result = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-          volatile uint64_t v = manager.GetValue();
-          (void)v;
+          uint64_t v = manager.GetValue();
+          // Simulate work after acquiring resource
+          work_result += g_work_simulator.DoWork(work_level, v);
           local_reads++;
         }
+        (void)work_result;
         total_reads.fetch_add(local_reads, std::memory_order_relaxed);
       });
     }
@@ -677,16 +817,20 @@ class Benchmark {
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> total_reads{0};
     std::atomic<uint64_t> total_writes{0};
+    WorkSimulator::WorkLevel work_level = config.work_level;
 
     std::vector<std::thread> readers;
     for (int i = 0; i < config.num_readers; i++) {
-      readers.emplace_back([&]() {
+      readers.emplace_back([&, work_level]() {
         uint64_t local_reads = 0;
+        volatile uint64_t work_result = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-          volatile uint64_t v = manager.GetValue();
-          (void)v;
+          uint64_t v = manager.GetValue();
+          // Simulate work after acquiring resource
+          work_result += g_work_simulator.DoWork(work_level, v);
           local_reads++;
         }
+        (void)work_result;
         total_reads.fetch_add(local_reads, std::memory_order_relaxed);
       });
     }
@@ -742,6 +886,15 @@ int main(int argc, char** argv) {
          config.write_interval_us);
   printf("  Scenario: Read-heavy workload with infrequent updates\n\n");
 
+  // =========================================================================
+  // Part 1: No work (pure acquisition benchmark) - original behavior
+  // =========================================================================
+  printf("=============================================================================\n");
+  printf("  Part 1: No Work (Pure Resource Acquisition)\n");
+  printf("=============================================================================\n\n");
+
+  config.work_level = WorkSimulator::WorkLevel::kNone;
+
   // Header
   printf("%-6s | %-14s | %-14s | %-14s | %-14s | %-14s | %-14s | %-14s\n",
          "Rdrs", "ThreadLocal", "TL+VerChk", "Versioned-TL", "atomic<sp>", "RCU-style", "RWLock", "Mutex");
@@ -771,9 +924,65 @@ int main(int argc, char** argv) {
            mtx.reads_per_second / 1e6);
   }
 
-  // Speedup table
-  printf("\n=== Speedup vs Mutex (8 readers) ===\n");
+  // =========================================================================
+  // Part 2: With realistic work simulation
+  // =========================================================================
+  printf("\n=============================================================================\n");
+  printf("  Part 2: With Work Simulation (8 readers)\n");
+  printf("=============================================================================\n\n");
+
+  printf("Work levels:\n");
+  printf("  - Minimal: ~10 hash lookups\n");
+  printf("  - Light:   ~50 hash lookups + small allocation (64B)\n");
+  printf("  - Medium:  ~100 hash lookups + medium allocation (4KB) + computation\n");
+  printf("  - Heavy:   ~500 hash lookups + large allocation (64KB) + heavy computation\n\n");
+
   config.num_readers = 8;
+
+  // Header
+  printf("%-10s | %-12s | %-12s | %-12s | %-12s | %-12s | %-12s | %-12s\n",
+         "Work", "ThreadLocal", "TL+VerChk", "Versioned-TL", "atomic<sp>", "RCU-style", "RWLock", "Mutex");
+  printf("-----------|--------------|--------------|--------------|--------------|--------------|--------------|-------------\n");
+
+  std::vector<WorkSimulator::WorkLevel> work_levels = {
+      WorkSimulator::WorkLevel::kNone,
+      WorkSimulator::WorkLevel::kMinimal,
+      WorkSimulator::WorkLevel::kLight,
+      WorkSimulator::WorkLevel::kMedium,
+      WorkSimulator::WorkLevel::kHeavy,
+  };
+
+  for (auto work_level : work_levels) {
+    config.work_level = work_level;
+
+    auto tl = Benchmark::RunThreadLocalBenchmark<false>(config);
+    auto tlvc = Benchmark::RunThreadLocalBenchmark<true>(config);
+    auto vtl = Benchmark::RunVersionedThreadLocalBenchmark(config);
+    auto asp = Benchmark::RunAtomicSharedPtrBenchmark(config);
+    auto rcu = Benchmark::RunRCUStyleBenchmark(config);
+    auto rwl = Benchmark::RunRWLockBenchmark(config);
+    auto mtx = Benchmark::RunMutexBenchmark(config);
+
+    printf("%-10s | %9.2f M | %9.2f M | %9.2f M | %9.2f M | %9.2f M | %9.2f M | %9.2f M\n",
+           Benchmark::WorkLevelName(work_level),
+           tl.reads_per_second / 1e6,
+           tlvc.reads_per_second / 1e6,
+           vtl.reads_per_second / 1e6,
+           asp.reads_per_second / 1e6,
+           rcu.reads_per_second / 1e6,
+           rwl.reads_per_second / 1e6,
+           mtx.reads_per_second / 1e6);
+  }
+
+  // =========================================================================
+  // Part 3: Speedup analysis with Medium work (realistic case)
+  // =========================================================================
+  printf("\n=============================================================================\n");
+  printf("  Part 3: Speedup Analysis (8 readers, Medium work)\n");
+  printf("=============================================================================\n\n");
+
+  config.num_readers = 8;
+  config.work_level = WorkSimulator::WorkLevel::kMedium;
 
   auto tl = Benchmark::RunThreadLocalBenchmark<false>(config);
   auto tlvc = Benchmark::RunThreadLocalBenchmark<true>(config);
@@ -783,6 +992,7 @@ int main(int argc, char** argv) {
   auto rwl = Benchmark::RunRWLockBenchmark(config);
   auto mtx = Benchmark::RunMutexBenchmark(config);
 
+  printf("=== Speedup vs Mutex (8 readers, Medium work) ===\n");
   printf("ThreadLocal:     %.2fx\n", tl.reads_per_second / mtx.reads_per_second);
   printf("TL+VerChk:       %.2fx\n", tlvc.reads_per_second / mtx.reads_per_second);
   printf("Versioned-TL:    %.2fx\n", vtl.reads_per_second / mtx.reads_per_second);
@@ -790,17 +1000,57 @@ int main(int argc, char** argv) {
   printf("RCU-style:       %.2fx\n", rcu.reads_per_second / mtx.reads_per_second);
   printf("RWLock:          %.2fx\n", rwl.reads_per_second / mtx.reads_per_second);
 
-  printf("\n=== Speedup vs atomic<shared_ptr> (8 readers) ===\n");
+  printf("\n=== Speedup vs atomic<shared_ptr> (8 readers, Medium work) ===\n");
   printf("ThreadLocal:     %.2fx\n", tl.reads_per_second / asp.reads_per_second);
   printf("TL+VerChk:       %.2fx\n", tlvc.reads_per_second / asp.reads_per_second);
   printf("Versioned-TL:    %.2fx\n", vtl.reads_per_second / asp.reads_per_second);
   printf("RCU-style:       %.2fx\n", rcu.reads_per_second / asp.reads_per_second);
 
-  printf("\n=== Version check overhead (8 readers) ===\n");
+  printf("\n=== Version check overhead (8 readers, Medium work) ===\n");
   printf("TL+VerChk vs TL: %.2fx\n", tlvc.reads_per_second / tl.reads_per_second);
   printf("Versioned-TL vs TL: %.2fx\n", vtl.reads_per_second / tl.reads_per_second);
 
+  // =========================================================================
+  // Part 4: Comparison - No work vs Medium work
+  // =========================================================================
+  printf("\n=============================================================================\n");
+  printf("  Part 4: Impact of Work on Relative Performance (8 readers)\n");
+  printf("=============================================================================\n\n");
+
+  config.work_level = WorkSimulator::WorkLevel::kNone;
+  auto tl_nowork = Benchmark::RunThreadLocalBenchmark<false>(config);
+  auto asp_nowork = Benchmark::RunAtomicSharedPtrBenchmark(config);
+  auto mtx_nowork = Benchmark::RunMutexBenchmark(config);
+
+  config.work_level = WorkSimulator::WorkLevel::kMedium;
+  auto tl_work = Benchmark::RunThreadLocalBenchmark<false>(config);
+  auto asp_work = Benchmark::RunAtomicSharedPtrBenchmark(config);
+  auto mtx_work = Benchmark::RunMutexBenchmark(config);
+
+  printf("%-20s | %-15s | %-15s\n", "Metric", "No Work", "Medium Work");
+  printf("---------------------|-----------------|----------------\n");
+  printf("%-20s | %12.2fx | %12.2fx\n", "TL vs Mutex",
+         tl_nowork.reads_per_second / mtx_nowork.reads_per_second,
+         tl_work.reads_per_second / mtx_work.reads_per_second);
+  printf("%-20s | %12.2fx | %12.2fx\n", "TL vs atomic<sp>",
+         tl_nowork.reads_per_second / asp_nowork.reads_per_second,
+         tl_work.reads_per_second / asp_work.reads_per_second);
+  printf("%-20s | %12.2fx | %12.2fx\n", "atomic<sp> vs Mutex",
+         asp_nowork.reads_per_second / mtx_nowork.reads_per_second,
+         asp_work.reads_per_second / mtx_work.reads_per_second);
+
   printf("\n=== Analysis ===\n\n");
+
+  printf("Key Insight: When readers do real work after acquiring the resource,\n");
+  printf("the relative advantage of lock-free approaches diminishes because:\n");
+  printf("1. The work dominates the total time, amortizing acquisition cost\n");
+  printf("2. Contention is reduced as threads spend more time doing work\n");
+  printf("3. Lock-based approaches become more competitive\n\n");
+
+  printf("However, the ThreadLocal pattern still wins because:\n");
+  printf("1. It avoids cache line bouncing between cores\n");
+  printf("2. The fast path is truly lock-free (just thread-local operations)\n");
+  printf("3. No shared state is touched in the common case\n\n");
 
   printf("1. ThreadLocal (RocksDB pattern):\n");
   printf("   - Best for: High-frequency reads, infrequent writes\n");

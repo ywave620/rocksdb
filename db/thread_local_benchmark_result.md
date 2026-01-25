@@ -9,6 +9,13 @@ Frequent atomic operations across threads like spinlock is really bad for mult t
 This is why thread local ptr beats others
 This is why RWMutex beats Mutex
 
+**New findings with realistic work simulation:**
+
+When readers do realistic work (hash table lookups, memory allocation, computation) after acquiring the resource:
+- The relative advantage of lock-free approaches diminishes as work amortizes acquisition cost
+- ThreadLocal pattern still provides 2.5-3x speedup over Mutex even with medium work
+- ThreadLocal provides 5-6x speedup over atomic<shared_ptr> with medium work
+- RCU-style remains fastest but the gap narrows significantly
 
 ## how to run
 
@@ -36,6 +43,7 @@ g++ -std=c++17 -O3 -I. -Iinclude -pthread \
     -o thread_local_resource_bench
 ```
 
+## Benchmark Results - Pure Resource Acquisition (No Work)
 
 ● The benchmark results are very illuminating. Let me summarize the findings:
 
@@ -44,105 +52,94 @@ g++ -std=c++17 -O3 -I. -Iinclude -pthread \
   ┌────────────────────────┬─────────────────────┬──────────┬───────────────────────┐
   │ Approach               │ 8 Readers (M ops/s) │ vs Mutex │ vs atomic<shared_ptr> │
   ├────────────────────────┼─────────────────────┼──────────┼───────────────────────┤
-  │ **RCU-style**          │           7324.56 M │   61.76x │               132.29x │
+  │ **RCU-style**          │           4416.72 M │   76.12x │                97.54x │
   ├────────────────────────┼─────────────────────┼──────────┼───────────────────────┤
-  │ **ThreadLocal**        │            403.73 M │    3.25x │                 6.97x │
+  │ **ThreadLocal**        │            529.51 M │    9.13x │                11.69x │
   ├────────────────────────┼─────────────────────┼──────────┼───────────────────────┤
-  │ **Mutex**              │             63.21 M │    1.00x │                 1.21x │
+  │ **Versioned-TL**       │            538.00 M │    9.27x │                11.88x │
   ├────────────────────────┼─────────────────────┼──────────┼───────────────────────┤
-  │ **atomic<shared_ptr>** │             52.24 M │    0.47x │                 1.00x │
+  │ **Mutex**              │             58.02 M │    1.00x │                 1.28x │
   ├────────────────────────┼─────────────────────┼──────────┼───────────────────────┤
-  │ **RWLock**             │             26.99 M │    0.30x │                 0.52x │
+  │ **atomic<shared_ptr>** │             45.31 M │    0.78x │                 1.00x │
+  ├────────────────────────┼─────────────────────┼──────────┼───────────────────────┤
+  │ **RWLock**             │             28.32 M │    0.49x │                 0.63x │
   └────────────────────────┴─────────────────────┴──────────┴───────────────────────┘
 
-  Key Findings:
+## Benchmark Results - With Realistic Work Simulation (8 readers)
 
-  1. RCU-style (atomic pointer) is fastest (~7.3 billion ops/sec with 8 readers)
-  because readers only do a single atomic load. However, it has complex memory
-  reclamation requirements.
-  2. ThreadLocal (RocksDB pattern) is ~7x faster than atomic<shared_ptr> and ~3x faster
-   than mutex. The key advantage is that in steady state (no writes), threads don't
-  touch any shared state.
-  3. atomic<shared_ptr> (using std::atomic_load/store) performs worse than mutex in
-  this benchmark! This is because:
-    - The C++ standard library implementation uses an internal spinlock
-    - Every read increments AND decrements the shared refcount
-    - This causes massive cache line bouncing between cores
-  4. RWLock (shared_mutex) performs worst due to the overhead of managing reader counts
-   atomically.
+Work levels tested:
+- **Minimal**: ~10 hash lookups
+- **Light**: ~50 hash lookups + small allocation (64B)
+- **Medium**: ~100 hash lookups + medium allocation (4KB) + computation
+- **Heavy**: ~500 hash lookups + large allocation (64KB) + heavy computation
 
-  Why ThreadLocal Beats atomic<shared_ptr>:
+  ┌────────────────────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+  │ Approach               │ None    │ Minimal │ Light   │ Medium  │ Heavy   │
+  ├────────────────────────┼─────────┼─────────┼─────────┼─────────┼─────────┤
+  │ **RCU-style**          │ 4331.95 │ 403.39  │  88.15  │  47.77  │   2.74  │
+  ├────────────────────────┼─────────┼─────────┼─────────┼─────────┼─────────┤
+  │ **ThreadLocal**        │  396.44 │ 239.27  │  64.67  │  36.81  │   2.51  │
+  ├────────────────────────┼─────────┼─────────┼─────────┼─────────┼─────────┤
+  │ **Versioned-TL**       │  385.19 │ 134.11  │  72.96  │  42.73  │   2.52  │
+  ├────────────────────────┼─────────┼─────────┼─────────┼─────────┼─────────┤
+  │ **Mutex**              │   58.68 │  19.61  │  10.86  │  14.90  │   1.84  │
+  ├────────────────────────┼─────────┼─────────┼─────────┼─────────┼─────────┤
+  │ **atomic<shared_ptr>** │   46.46 │  17.56  │   8.06  │   7.14  │   1.59  │
+  ├────────────────────────┼─────────┼─────────┼─────────┼─────────┼─────────┤
+  │ **RWLock**             │   29.35 │  14.22  │   5.55  │   4.37  │   1.50  │
+  └────────────────────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+  (All values in M ops/sec)
 
-  The ThreadLocal pattern avoids the main problem with atomic<shared_ptr>:
-  - Fast path: Reader only touches its own thread-local slot (no shared cache lines)
-  - Slow path (after write): Only happens once per writer update, then thread caches
-  the new value
+## Impact of Work on Relative Performance (8 readers)
 
-  With atomic<shared_ptr>, every single read does:
-  1. Atomic load of the shared_ptr (internal spinlock)
-  2. Atomic increment of refcount
-  3. Read the value
-  4. Atomic decrement of refcount
+  ┌──────────────────────┬─────────────┬─────────────┐
+  │ Metric               │ No Work     │ Medium Work │
+  ├──────────────────────┼─────────────┼─────────────┤
+  │ TL vs Mutex          │      6.69x  │      2.66x  │
+  ├──────────────────────┼─────────────┼─────────────┤
+  │ TL vs atomic<sp>     │      8.77x  │      5.37x  │
+  ├──────────────────────┼─────────────┼─────────────┤
+  │ atomic<sp> vs Mutex  │      0.76x  │      0.49x  │
+  └──────────────────────┴─────────────┴─────────────┘
 
-  This causes cache line contention that kills scalability.
+## Key Findings
 
-● The benchmark results are very informative. Here's a summary:
+1. **RCU-style (single atomic load)** is the fastest by far (~4.4 billion ops/sec with 8
+readers with no work), but it has memory reclamation challenges - the simplified version leaks
+memory.
 
-  Benchmark Results Summary
+2. **ThreadLocal pattern (RocksDB's approach)** achieves ~530M ops/sec with 8 readers (no work),
+which is ~11.7x faster than atomic<shared_ptr> and ~9x faster than mutex. It scales
+well with readers because the fast path touches no shared state.
 
-  ┌──────────────────────────┬─────────────────────┬──────────┬────────────────────────
-  ─┐
-  │ Approach                 │ 8 Readers (M ops/s) │ vs Mutex │ vs atomic\<shared_ptr\>
-   │
-  ├──────────────────────────┼─────────────────────┼──────────┼────────────────────────
-  ─┤
-  │ **RCU-style**            │ 7,415 M             │ 124x     │ 148x
-   │
-  ├──────────────────────────┼─────────────────────┼──────────┼────────────────────────
-  ─┤
-  │ **ThreadLocal**          │ 400 M               │ 6.9x     │ 8.3x
-   │
-  ├──────────────────────────┼─────────────────────┼──────────┼────────────────────────
-  ─┤
-  │ **Mutex**                │ 63 M                │ 1.0x     │ 1.2x
-   │
-  ├──────────────────────────┼─────────────────────┼──────────┼────────────────────────
-  ─┤
-  │ **atomic\<shared_ptr\>** │ 51 M                │ 0.84x    │ 1.0x
-   │
-  ├──────────────────────────┼─────────────────────┼──────────┼────────────────────────
-  ─┤
-  │ **RWLock**               │ 27 M                │ 0.41x    │ 0.53x
-   │
-  └──────────────────────────┴─────────────────────┴──────────┴────────────────────────
-  ─┘
+3. **atomic<shared_ptr>** using std::atomic_load/store is actually slower than mutex in
+this benchmark! This is because:
+  - Each read requires acquiring an internal spinlock (libc++ implementation)
+  - Plus atomic refcount increment/decrement
+  - Heavy cache line contention on the shared_ptr's control block
 
-  Key Findings
+4. **RWLock (shared_mutex)** performs worst due to its overhead - acquiring even a shared
+lock has significant cost.
 
-  1. RCU-style (single atomic load) is the fastest by far (~7.4 billion ops/sec with 8
-  readers), but it has memory reclamation challenges - the simplified version leaks
-  memory.
-  2. ThreadLocal pattern (RocksDB's approach) achieves ~400M ops/sec with 8 readers,
-  which is 8.25x faster than atomicshared_ptr and 6.9x faster than mutex. It scales
-  linearly with readers because the fast path touches no shared state.
-  3. atomicshared_ptr using std::atomic_load/store is actually slower than mutex in
-  this benchmark! This is because:
-    - Each read requires acquiring an internal spinlock (libc++ implementation)
-    - Plus atomic refcount increment/decrement
-    - Heavy cache line contention on the shared_ptr's control block
-  4. RWLock (shared_mutex) performs worst due to its overhead - acquiring even a shared
-   lock has significant cost.
-  5. Mutex actually performs reasonably for single reader but degrades under
-  contention.
+5. **With realistic work simulation**:
+  - ThreadLocal still provides 2.5-3x speedup over Mutex
+  - ThreadLocal provides 5-6x speedup over atomic<shared_ptr>
+  - The relative advantages diminish as work dominates total time
+  - But ThreadLocal remains the best choice for this pattern
 
-  Why ThreadLocal Pattern Wins (for this use case)
+## Why ThreadLocal Pattern Wins (for this use case)
 
-  The ThreadLocal pattern's advantage is that in steady state (no writes), each
-  thread's read operation only touches thread-local memory:
-  - One atomic swap on the thread's own TLS slot
-  - Read the cached resource
-  - One atomic CAS to return it
+The ThreadLocal pattern's advantage is that in steady state (no writes), each
+thread's read operation only touches thread-local memory:
+- One atomic swap on the thread's own TLS slot
+- Read the cached resource
+- One atomic CAS to return it
 
-  No shared cache lines are bounced between CPUs, making it scale perfectly with the
-  number of readers.
+No shared cache lines are bounced between CPUs, making it scale perfectly with the
+number of readers.
 
+**Even with realistic work**, the pattern maintains significant advantages because:
+1. It avoids cache line bouncing between cores
+2. The fast path is truly lock-free (just thread-local operations)  
+3. No shared state is touched in the common case
+4. Lower contention means threads spend more time doing actual work
